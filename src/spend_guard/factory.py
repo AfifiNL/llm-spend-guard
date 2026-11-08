@@ -4,6 +4,7 @@ SPEND_GUARD_DATABASE_URL     PostgreSQL (without it, a throwaway local server vi
 SPEND_GUARD_PROVIDER         mock (default) | gemini | openai | anthropic | replay
 SPEND_GUARD_MAX_LIVE_CALLS   live providers: hard cap on calls per process (default 0: none)
 SPEND_GUARD_OPENAI_API       openai: chat (default) | responses
+SPEND_GUARD_ANTHROPIC_INFERENCE_GEO  anthropic: region to request and require (default: unset)
 SPEND_GUARD_GEMINI_VERTEX    true: Vertex AI (ADC + GOOGLE_CLOUD_PROJECT); else GEMINI_API_KEY
 SPEND_GUARD_GEMINI_LOCATION, SPEND_GUARD_GEMINI_THINKING_LEVEL
 SPEND_GUARD_CASSETTE         replay: the recorded calls
@@ -57,7 +58,9 @@ def build_provider() -> Provider:
     if kind == "anthropic":  # credentials: ANTHROPIC_API_KEY, read by the SDK
         from spend_guard.providers.anthropic_api import AnthropicProvider
 
-        return AnthropicProvider(max_calls=cap)
+        return AnthropicProvider(
+            max_calls=cap, inference_geo=_env("SPEND_GUARD_ANTHROPIC_INFERENCE_GEO") or None
+        )
     raise ValueError(f"unknown SPEND_GUARD_PROVIDER {kind!r}")
 
 

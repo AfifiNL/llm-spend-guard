@@ -93,17 +93,19 @@ CREATE TABLE IF NOT EXISTS api_keys (
     revoked_at  TIMESTAMPTZ
 );
 
--- Client-supplied request ids: one id is one request, answered once and replayed after that.
+-- Client-supplied request ids, per tenant: one id is one request, answered once and replayed
+-- after that. Another tenant's id is a different key, so ids never leak across tenants.
 CREATE TABLE IF NOT EXISTS idempotency (
-    request_id      UUID PRIMARY KEY,
     tenant          TEXT NOT NULL,
+    request_id      UUID NOT NULL,
     fingerprint     TEXT NOT NULL,
     status          TEXT NOT NULL CHECK (status IN ('in_flight', 'completed', 'failed')),
     reservation_id  UUID,
     result          JSONB,
     note            TEXT NOT NULL DEFAULT '',
     created_at      TIMESTAMPTZ NOT NULL,
-    finished_at     TIMESTAMPTZ
+    finished_at     TIMESTAMPTZ,
+    PRIMARY KEY (tenant, request_id)
 );
 
 CREATE TABLE IF NOT EXISTS alerts (

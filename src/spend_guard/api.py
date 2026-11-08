@@ -1,19 +1,23 @@
-"""HTTP API. `/v1/complete` runs a call through the guard; refusals map to distinct status codes:
-402 budget exceeded, 409 no checked price or a request_id conflict, 403 no budget configured or
-a tenant the caller may not use, 502 provider error. Prices, budgets and keys are managed with
-the CLI only, so the network API cannot raise a limit or mint a key.
+"""HTTP API. `/v1/complete` runs a call through the guard. Every error body is
+`{"detail": {"code": <stable machine-readable code>, "message": <text for people>}}`; clients
+branch on `code`, never on the message (see the README's table of codes).
+
+Prices, budgets and keys are managed with the CLI only, so the network API cannot raise a limit
+or mint a key.
 
 Two ways in, both `Authorization: Bearer ...`:
   * an API key (`llm-spend-guard key-create <tenant>`): the key decides the tenant. A request
     that names another tenant is refused (403); the tenant may be left out of the body.
   * the shared token SPEND_GUARD_API_TOKEN, for one trusted caller: it names the tenant in each
     request and can use any of them. Unset it once every client has its own key.
-Fail-closed: with no shared token and no active key, every request is refused (503)."""
+A refused credential gets 401. Only when no shared token is configured and no active key exists
+(checked at most every 10 seconds) does the API answer 503 instead: nothing could ever pass."""
 
 from __future__ import annotations
 
 import hmac
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Annotated, Any
@@ -29,6 +33,7 @@ from spend_guard.errors import (
     NoBudget,
     NoCheckedPrice,
     RequestIdConflict,
+    RequestIdSpent,
     RequestInFlight,
 )
 from spend_guard.gateway import SpendGuard
@@ -56,6 +61,16 @@ class CompleteIn(BaseModel):
         return v
 
 
+RETRY_IN_FLIGHT_S = 5
+KEY_CHECK_EVERY_S = 10.0
+
+
+def error(
+    status: int, code: str, message: str, headers: dict[str, str] | None = None
+) -> HTTPException:
+    return HTTPException(status, {"code": code, "message": message}, headers=headers)
+
+
 @dataclass(frozen=True)
 class Caller:
     tenant: str | None  # bound tenant (API key), or None for the shared token
@@ -63,11 +78,25 @@ class Caller:
     def resolve(self, requested: str | None) -> str:
         if self.tenant is None:
             if requested is None:
-                raise HTTPException(422, "tenant is required with the shared token")
+                raise error(422, "tenant_required", "tenant is required with the shared token")
             return requested
         if requested is not None and requested != self.tenant:
-            raise HTTPException(403, "this API key belongs to another tenant")
+            raise error(403, "tenant_mismatch", "this API key belongs to another tenant")
         return self.tenant
+
+
+def _keys_exist(request: Request) -> bool:
+    """Whether any active key exists, cached so anonymous traffic does not query each time.
+    Once true it stays true for the process (a refused credential gets 401 either way)."""
+    st = request.app.state
+    now = time.monotonic()
+    if st.keys_exist or now - st.keys_checked_at < KEY_CHECK_EVERY_S:
+        return bool(st.keys_exist)
+    guard: SpendGuard = st.guard
+    with guard.ledger.pool.connection() as conn:
+        st.keys_exist = keys.active_keys(conn) > 0
+    st.keys_checked_at = now
+    return bool(st.keys_exist)
 
 
 def _caller(request: Request, authorization: Annotated[str | None, Header()] = None) -> Caller:
@@ -80,14 +109,11 @@ def _caller(request: Request, authorization: Annotated[str | None, Header()] = N
         with guard.ledger.pool.connection() as conn:
             tenant = keys.tenant_for(conn, given)
         if tenant is not None:
+            request.app.state.keys_exist = True
             return Caller(tenant=tenant)
-    if not api_token:
-        with guard.ledger.pool.connection() as conn:
-            if keys.active_keys(conn) == 0:
-                raise HTTPException(
-                    503, "API disabled: no SPEND_GUARD_API_TOKEN and no active API key"
-                )
-    raise HTTPException(401, "invalid token")
+    if not api_token and not _keys_exist(request):
+        raise error(503, "api_disabled", "no SPEND_GUARD_API_TOKEN and no active API key")
+    raise error(401, "unauthorized", "invalid or missing credential")
 
 
 CallerDep = Annotated[Caller, Depends(_caller)]
@@ -100,10 +126,13 @@ def create_app(guard: SpendGuard, *, api_token: str | None) -> FastAPI:
     async def invalid(_: Request, exc: RequestValidationError) -> JSONResponse:
         # Never echo the input back: it may be large, private or not even encodable.
         errors = [{"loc": list(e.get("loc", ())), "msg": e.get("msg", "")} for e in exc.errors()]
-        return JSONResponse({"detail": errors}, status_code=422)
+        body = {"code": "invalid_request", "message": "the request is invalid", "errors": errors}
+        return JSONResponse({"detail": body}, status_code=422)
 
     app.state.guard = guard
     app.state.api_token = api_token
+    app.state.keys_exist = False
+    app.state.keys_checked_at = float("-inf")
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -123,17 +152,25 @@ def create_app(guard: SpendGuard, *, api_token: str | None) -> FastAPI:
             )
         except BudgetExceeded as exc:
             # No amounts: the global scope's spend is not every tenant's business.
-            raise HTTPException(402, f"daily budget reached for {exc.scope}") from None
+            raise error(402, "budget_exceeded", f"daily budget reached for {exc.scope}") from None
         except NoCheckedPrice as exc:
-            raise HTTPException(409, str(exc)) from None
+            raise error(409, "no_checked_price", str(exc)) from None
         except NoBudget as exc:
-            raise HTTPException(403, str(exc)) from None
-        except (RequestInFlight, RequestIdConflict) as exc:
-            raise HTTPException(409, str(exc)) from None
+            raise error(403, "no_budget", str(exc)) from None
+        except RequestInFlight as exc:
+            raise error(
+                409, "request_in_flight", str(exc), {"Retry-After": str(RETRY_IN_FLIGHT_S)}
+            ) from None
+        except RequestIdSpent as exc:
+            raise error(409, "request_id_spent", str(exc)) from None
+        except RequestIdConflict as exc:
+            raise error(409, "request_id_conflict", str(exc)) from None
         except ValueError as exc:  # an invalid tenant id the pattern let through ("*" is not)
-            raise HTTPException(422, str(exc)) from None
-        except (ProviderRejected, ProviderFailed) as exc:
-            raise HTTPException(502, str(exc)) from None
+            raise error(422, "invalid_tenant", str(exc)) from None
+        except ProviderRejected as exc:
+            raise error(502, "provider_rejected", str(exc)) from None
+        except ProviderFailed as exc:
+            raise error(502, "provider_failed", str(exc)) from None
         return {
             "request_id": str(body.request_id or c.request_id),
             "reservation_id": str(c.request_id),
@@ -143,6 +180,8 @@ def create_app(guard: SpendGuard, *, api_token: str | None) -> FastAPI:
             "usage": {"input_tokens": c.input_tokens, "output_tokens": c.output_tokens},
             "reserved": fmt(c.reserved_micros),
             "cost": fmt(c.cost_micros),
+            # What this HTTP call added to the ledger: zero for a replay. Sum this, not `cost`.
+            "charged_now": fmt(0 if c.replayed else c.cost_micros),
         }
 
     @app.get("/v1/budgets/{tenant}")
@@ -151,9 +190,9 @@ def create_app(guard: SpendGuard, *, api_token: str | None) -> FastAPI:
         try:
             rows = guard.ledger.status(tenant)
         except NoBudget as exc:
-            raise HTTPException(403, str(exc)) from None
+            raise error(403, "no_budget", str(exc)) from None
         except ValueError as exc:
-            raise HTTPException(422, str(exc)) from None
+            raise error(422, "invalid_tenant", str(exc)) from None
         return [
             {
                 "scope": s.scope,

@@ -12,7 +12,12 @@ from psycopg_pool import ConnectionPool
 from conftest import NOW, Clock, setup_prices_and_budgets
 from spend_guard import keys
 from spend_guard.api import create_app
-from spend_guard.errors import BudgetExceeded, RequestIdConflict, RequestInFlight
+from spend_guard.errors import (
+    BudgetExceeded,
+    RequestIdConflict,
+    RequestIdSpent,
+    RequestInFlight,
+)
 from spend_guard.gateway import SpendGuard
 from spend_guard.ledger import SpendLedger
 from spend_guard.providers.base import ProviderFailed, ProviderRejected, ProviderResult
@@ -71,13 +76,24 @@ def test_repeat_returns_the_stored_result_and_charges_once(
 def test_same_id_for_a_different_request_is_a_conflict(
     pool: ConnectionPool[Any], clock: Clock
 ) -> None:
-    g = guard(pool, clock, Counting())
+    p = Counting()
+    g = guard(pool, clock, p)
     rid = uuid.uuid4()
     g.complete("acme", "m1", "hello", request_id=rid)
     with pytest.raises(RequestIdConflict, match="different request"):
         g.complete("acme", "m1", "something else", request_id=rid)
-    with pytest.raises(RequestIdConflict, match="different request"):
-        g.complete("other", "m1", "hello", request_id=rid)  # another tenant cannot read it
+
+
+def test_request_ids_are_per_tenant(pool: ConnectionPool[Any], clock: Clock) -> None:
+    p = Counting()
+    g = guard(pool, clock, p)
+    rid = uuid.uuid4()
+    mine = g.complete("acme", "m1", "hello", request_id=rid)
+    # Another tenant using the same id gets its own request: nothing about acme's leaks.
+    theirs = g.complete("other", "m1", "a different question", request_id=rid)
+    assert not theirs.replayed
+    assert theirs.request_id != mine.request_id
+    assert p.calls == 2
 
 
 def test_concurrent_repeats_make_one_call(pool: ConnectionPool[Any], clock: Clock) -> None:
@@ -142,27 +158,59 @@ def test_a_failure_that_may_be_billed_is_not_retried_under_the_same_id(
     with pytest.raises(ProviderFailed):
         g.complete("acme", "m1", "hello", request_id=rid)
     p.fail = None
-    with pytest.raises(RequestIdConflict, match="new request_id"):
+    with pytest.raises(RequestIdSpent, match="new request_id"):
         g.complete("acme", "m1", "hello", request_id=rid)
     assert p.calls == 1
 
 
-def test_abandoned_request_and_prune(pool: ConnectionPool[Any], clock: Clock) -> None:
-    g = guard(pool, clock, Counting())
+def test_result_is_returned_even_if_it_cannot_be_stored(
+    pool: ConnectionPool[Any], clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = Counting()
+    g = guard(pool, clock, p)
+
+    def broken(*_: Any) -> None:
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(g.idempotency, "complete", broken)
     rid = uuid.uuid4()
-    assert g.idempotency.begin(rid, "acme", "fp") is None  # a caller that then crashed
-    with pytest.raises(RequestInFlight):
-        g.idempotency.begin(rid, "acme", "fp")
+    c = g.complete("acme", "m1", "hello", request_id=rid)
+    assert c.text == "answer to hello"  # the caller still gets its answer
+    with pytest.raises(RequestInFlight):  # a quick retry is not run again...
+        g.complete("acme", "m1", "hello", request_id=rid)
     clock.now = NOW + dt.timedelta(minutes=20)
-    with pytest.raises(RequestIdConflict, match="abandoned"):
-        g.idempotency.begin(rid, "acme", "fp")
+    assert g.idempotency.sweep_stale() == 1
+    with pytest.raises(RequestIdSpent):  # ...and neither is a late one
+        g.complete("acme", "m1", "hello", request_id=rid)
+    assert p.calls == 1
+
+
+def test_abandoned_requests_are_swept_and_failures_kept_longer(
+    pool: ConnectionPool[Any], clock: Clock
+) -> None:
+    g = guard(pool, clock, Counting())
+    stuck = uuid.uuid4()
+    assert g.idempotency.begin("acme", stuck, "fp") is None  # a caller that then crashed
+    with pytest.raises(RequestInFlight):
+        g.idempotency.begin("acme", stuck, "fp")
     done = uuid.uuid4()
     g.complete("acme", "m1", "hello", request_id=done)
+    clock.now = NOW + dt.timedelta(minutes=20)
+    with pytest.raises(RequestIdSpent, match="abandoned"):  # stale: never run again
+        g.idempotency.begin("acme", stuck, "fp")
     clock.now = NOW + dt.timedelta(days=2)
-    assert g.idempotency.prune(dt.timedelta(hours=24)) == 1
+    # prune sweeps the stuck request to "failed", forgets the completed one (> 24 h), and
+    # keeps the failed one: it may have been billed, so a late redelivery must still be refused.
+    assert g.idempotency.prune() == 1
+    with pytest.raises(RequestIdSpent):
+        g.idempotency.begin("acme", stuck, "fp")
+    assert g.idempotency.begin("acme", done, "new fingerprint") is None  # forgotten: reusable
+    clock.now = NOW + dt.timedelta(days=40)
+    # The stuck one is forgotten 30 days after it failed; the id re-claimed on day 2 was only
+    # swept to "failed" now, so it is kept for another 30 days.
+    assert g.idempotency.prune() == 1
 
 
-# ── API keys ────────────────────────────────────────────────────────────────
 def test_keys_are_stored_as_hashes(pool: ConnectionPool[Any]) -> None:
     with pool.connection() as conn:
         key, key_id = keys.create_key(conn, "acme")
@@ -215,13 +263,30 @@ def test_key_decides_the_tenant(pool: ConnectionPool[Any], clock: Clock) -> None
 
 def test_revoked_key_and_fail_closed(pool: ConnectionPool[Any], clock: Clock) -> None:
     c = client(pool, clock)
-    assert c.get("/v1/budgets/acme", headers=bearer("anything")).status_code == 503
+    r = c.get("/v1/budgets/acme", headers=bearer("anything"))
+    assert r.status_code == 503  # neither a shared token nor any key: nothing could pass
+    assert r.json()["detail"]["code"] == "api_disabled"
     with pool.connection() as conn:
         key, key_id = keys.create_key(conn, "acme")
     assert c.get("/v1/budgets/acme", headers=bearer(key)).status_code == 200
     with pool.connection() as conn:
         keys.revoke_key(conn, key_id)
-    assert c.get("/v1/budgets/acme", headers=bearer(key)).status_code == 503  # no active key
+    r = c.get("/v1/budgets/acme", headers=bearer(key))
+    assert r.status_code == 401
+    assert r.json()["detail"]["code"] == "unauthorized"
+    assert c.get("/v1/budgets/acme").status_code == 401  # anonymous: same answer
+
+
+def test_anonymous_answer_does_not_depend_on_keys_with_a_token(
+    pool: ConnectionPool[Any], clock: Clock
+) -> None:
+    c = client(pool, clock, token="shared-test")
+    before = c.get("/v1/budgets/acme")
+    with pool.connection() as conn:
+        keys.create_key(conn, "acme")
+    after = c.get("/v1/budgets/acme")
+    assert before.status_code == after.status_code == 401
+    assert before.json() == after.json()
 
 
 def test_shared_token_still_names_its_tenant(pool: ConnectionPool[Any], clock: Clock) -> None:
@@ -253,9 +318,44 @@ def test_api_request_id_replay_and_conflict(pool: ConnectionPool[Any], clock: Cl
     assert first["request_id"] == rid
     assert (first["replayed"], again["replayed"]) == (False, True)
     assert again["reservation_id"] == first["reservation_id"]
+    assert again["cost"] == first["cost"] == first["charged_now"]
+    assert again["charged_now"] == "0.000000"  # summing charged_now never double counts
     clash = c.post("/v1/complete", headers=bearer("shared-test"), json={**body, "prompt": "x"})
     assert clash.status_code == 409
+    assert clash.json()["detail"]["code"] == "request_id_conflict"
     bad = c.post(
         "/v1/complete", headers=bearer("shared-test"), json={**body, "request_id": "not-a-uuid"}
     )
     assert bad.status_code == 422
+    assert bad.json()["detail"]["code"] == "invalid_request"
+
+
+def test_api_distinguishes_its_409s(pool: ConnectionPool[Any], clock: Clock) -> None:
+    gate = threading.Event()
+    provider = Counting(gate=gate)
+    g = guard(pool, clock, provider)
+    c = TestClient(create_app(g, api_token="shared-test"))
+    rid = str(uuid.uuid4())
+    body = {"tenant": "acme", "model": "m1", "prompt": "hi", "request_id": rid}
+    t = threading.Thread(
+        target=lambda: c.post("/v1/complete", headers=bearer("shared-test"), json=body)
+    )
+    t.start()
+    for _ in range(200):  # wait until the first request is inside the model call
+        if provider.calls == 1:
+            break
+        threading.Event().wait(0.02)
+    r = c.post("/v1/complete", headers=bearer("shared-test"), json=body)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "request_in_flight"
+    assert r.headers["Retry-After"] == "5"
+    gate.set()
+    t.join(10)
+    unpriced = c.post(
+        "/v1/complete",
+        headers=bearer("shared-test"),
+        json={"tenant": "acme", "model": "unpriced", "prompt": "hi"},
+    )
+    assert unpriced.status_code == 409
+    assert unpriced.json()["detail"]["code"] == "no_checked_price"
+    assert "Retry-After" not in unpriced.headers

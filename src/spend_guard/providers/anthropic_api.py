@@ -1,15 +1,21 @@
 """Anthropic adapter (optional extra `llm-spend-guard[anthropic]`). NEVER called against the real
-API during development: it is tested only with fake clients (tests/test_vendor_providers.py).
+API during development: it is tested only with fake clients and the SDK's own exception classes
+(tests/test_vendor_providers.py).
 
-Usage mapping (Anthropic's Messages API):
-  * `usage.input_tokens` counts only the uncached input; prompt caching adds
-    `cache_creation_input_tokens` (written to the cache) and `cache_read_input_tokens`.
-  * The price book has one input rate, so cached input is converted to input-rate tokens on the
-    safe side: cache writes count twice (the highest write multiplier in Anthropic's published
-    pricing when this was written; not re-checked) and cache reads count in full (they are billed
-    at a fraction). The guard can only over-count caching. This adapter never asks for caching,
-    so both fields are normally zero.
+Usage mapping (Messages API):
+  * `usage.input_tokens` counts only uncached input; prompt caching adds
+    `cache_creation_input_tokens` (writes) and `cache_read_input_tokens` (reads).
+  * Anthropic's prompt-caching page (read 2026-11-08) prices cache writes at 1.25x (5-minute
+    TTL) or 2x (1-hour TTL) the input rate and reads at 0.1x or less. The adapter charges writes
+    at 2x, the highest of those, and reads at the full input rate: caching can be over-counted,
+    not under-counted. On the Messages API caching is opt-in (`cache_control`), which this
+    adapter never sends, so both fields are normally zero.
   * `usage.output_tokens` is the output, including any extended-thinking tokens.
+  * Requests ask for the standard tier only (`service_tier="standard_only"`) and standard speed.
+    A response reporting another tier or speed is charged at its full reservation. Region:
+    with `inference_geo` set, it is sent and the response must report the same region; without
+    it, the workspace default applies and the reported region is not checked (region pricing
+    is not modelled).
 
 The SDK's own retries are switched off (`max_retries=0`), as for the other adapters.
 """
@@ -35,8 +41,18 @@ def input_equivalent(usage: Any) -> int | None:
 
 
 class AnthropicProvider:
-    def __init__(self, *, max_calls: int, timeout_s: float = 60.0, client: Any = None) -> None:
+    input_rate_ceiling = float(CACHE_WRITE_FACTOR)
+
+    def __init__(
+        self,
+        *,
+        max_calls: int,
+        inference_geo: str | None = None,
+        timeout_s: float = 60.0,
+        client: Any = None,
+    ) -> None:
         self.name = "anthropic"
+        self.inference_geo = inference_geo
         self.cap = CallCap(max_calls, "SPEND_GUARD_MAX_LIVE_CALLS")
         if client is None:
             from anthropic import Anthropic
@@ -53,11 +69,15 @@ class AnthropicProvider:
     ) -> ProviderResult:
         self.cap.take()
         kwargs: dict[str, Any] = {"system": system} if system else {}
+        if self.inference_geo:
+            kwargs["inference_geo"] = self.inference_geo
         try:
             resp = self._client.messages.create(
                 model=model,
                 max_tokens=max_output_tokens,
                 messages=[{"role": "user", "content": prompt}],
+                service_tier="standard_only",
+                speed="standard",
                 **kwargs,
             )
         except Exception as exc:
@@ -72,4 +92,18 @@ class AnthropicProvider:
             for block in (getattr(resp, "content", None) or [])
             if getattr(block, "type", None) == "text"
         )
-        return ProviderResult(text=text, input_tokens=inp, output_tokens=out)
+        return ProviderResult(
+            text=text, input_tokens=inp, output_tokens=out, unpriced_reason=self._unpriced(usage)
+        )
+
+    def _unpriced(self, usage: Any) -> str | None:
+        tier = getattr(usage, "service_tier", None)
+        if tier not in (None, "standard"):
+            return f"served on the {tier!r} tier, which the price book does not price"
+        speed = getattr(usage, "speed", None)
+        if speed not in (None, "standard"):
+            return f"served at {speed!r} speed, which the price book does not price"
+        geo = getattr(usage, "inference_geo", None)
+        if self.inference_geo and geo not in (None, self.inference_geo):
+            return f"served in region {geo!r}, not the configured {self.inference_geo!r}"
+        return None

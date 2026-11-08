@@ -8,6 +8,8 @@ exporter can ship them; nothing here depends on a vendor.
 
 from __future__ import annotations
 
+import logging
+import math
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +21,8 @@ from spend_guard.errors import BudgetExceeded, NoBudget, NoCheckedPrice
 from spend_guard.idempotency import IdempotencyStore, fingerprint
 from spend_guard.ledger import SpendLedger, tenant_scope
 from spend_guard.providers.base import Provider, ProviderFailed, ProviderRejected
+
+log = logging.getLogger("spend_guard")
 
 # Upper bound on input tokens: a tokenizer that covers at least one byte per token cannot
 # produce more tokens than the text has UTF-8 bytes. Chat formatting adds a few tokens per
@@ -95,8 +99,8 @@ class SpendGuard:
         tenant_scope(tenant)  # invalid ids fail here, before a request id is claimed
         if request_id is None:
             return self._complete(tenant, model, prompt, system, max_output_tokens)
-        fp = fingerprint(tenant, model, system, prompt, max_output_tokens)
-        prior = self.idempotency.begin(request_id, tenant, fp)
+        fp = fingerprint(model, system, prompt, max_output_tokens)
+        prior = self.idempotency.begin(tenant, request_id, fp)
         if prior is not None:
             with self.tracer.start_as_current_span("llm.complete") as span:
                 span.set_attribute("gen_ai.request.model", model)
@@ -108,12 +112,18 @@ class SpendGuard:
         try:
             result = self._complete(tenant, model, prompt, system, max_output_tokens)
         except (NoCheckedPrice, NoBudget, BudgetExceeded, ProviderRejected):
-            self.idempotency.release(request_id)  # nothing was charged: the id may be reused
+            self.idempotency.release(tenant, request_id)  # nothing charged: the id may be reused
             raise
         except BaseException as exc:
-            self.idempotency.fail(request_id, type(exc).__name__)
+            self.idempotency.fail(tenant, request_id, type(exc).__name__)
             raise
-        self.idempotency.complete(request_id, result.request_id, result.to_record())
+        try:
+            self.idempotency.complete(tenant, request_id, result.request_id, result.to_record())
+        except Exception:
+            # The call happened and was settled; only its replay record is missing. Return the
+            # result anyway. The key stays in flight and is swept to "failed" later, so a retry
+            # is refused rather than charged again.
+            log.exception("could not store the result for request %s", request_id)
         return result
 
     def _complete(
@@ -124,11 +134,12 @@ class SpendGuard:
             span.set_attribute("gen_ai.request.model", model)
             span.set_attribute("gen_ai.request.max_tokens", max_output_tokens)
             span.set_attribute("spend.tenant", tenant)
+            ceiling = float(getattr(self.provider, "input_rate_ceiling", 1.0))
             try:
                 res = self.ledger.reserve(
                     tenant,
                     model,
-                    max_input_tokens=max_input_tokens(system, prompt),
+                    max_input_tokens=math.ceil(max_input_tokens(system, prompt) * ceiling),
                     max_output_tokens=max_output_tokens,
                 )
             except (NoCheckedPrice, NoBudget, BudgetExceeded) as exc:
@@ -159,11 +170,16 @@ class SpendGuard:
                 span.set_attribute("spend.cost_micros", s.cost_micros)
                 span.set_status(Status(StatusCode.ERROR, "provider_failed"))
                 raise
-            settled = self.ledger.settle(res.request_id, out.input_tokens, out.output_tokens)
             span.set_attribute("gen_ai.usage.input_tokens", out.input_tokens)
             span.set_attribute("gen_ai.usage.output_tokens", out.output_tokens)
+            if out.unpriced_reason:
+                # Served in a way the price book has no price for: charge the full reservation.
+                settled = self.ledger.settle_worst_case(res.request_id, note=out.unpriced_reason)
+                span.set_attribute("spend.outcome", "unknown_cost")
+            else:
+                settled = self.ledger.settle(res.request_id, out.input_tokens, out.output_tokens)
+                span.set_attribute("spend.outcome", "overrun" if settled.overrun else "ok")
             span.set_attribute("spend.cost_micros", settled.cost_micros)
-            span.set_attribute("spend.outcome", "overrun" if settled.overrun else "ok")
             return Completion(
                 res.request_id,
                 out.text,

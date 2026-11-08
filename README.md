@@ -18,8 +18,8 @@ its limit is refused before it is made, and so is a call to a model without a ch
   amounts, for any exporter.
 - **API keys bound to tenants** (only their SHA-256 is stored), so one client cannot spend
   another client's budget; a shared token remains for a single trusted caller.
-- **Idempotent requests**: a client `request_id` is charged once; a retry gets the stored
-  result back, a concurrent retry gets 409.
+- **Idempotent requests**: a client `request_id` (per tenant) is charged once; a retry gets the
+  stored result back with `charged_now: 0`, a concurrent retry gets 409 `request_in_flight`.
 - **Providers**: a mock, so the demo and the tests spend nothing; a Gemini adapter with a
   recorded live probe that CI replays through a real ledger; OpenAI and Anthropic adapters that
   are tested with fake clients only and **have never been called against the real APIs**.
@@ -64,7 +64,7 @@ schema that they drop afterwards, so they never touch real budgets, prices or le
 ```bash
 make install    # .venv with extras, dev tools and the local PostgreSQL (locked)
 make demo       # the run above
-make check      # lint, strict types, 99 tests on PostgreSQL, probe replay, demo (what CI runs)
+make check      # lint, strict types, 119 tests on PostgreSQL, probe replay, demo (what CI runs)
 ```
 
 With your own PostgreSQL:
@@ -116,7 +116,7 @@ settle ─── actual = price × reported usage, rounded up to the micro-unit;
 
 | Method | Path | Result |
 |---|---|---|
-| `POST` | `/v1/complete` | `{tenant?, model, prompt, system?, max_output_tokens, request_id?}` → text, usage, reserved, cost, `replayed`; **402** budget, **409** no checked price or request-id conflict, **403** no budget configured or another tenant's key, **502** provider error |
+| `POST` | `/v1/complete` | `{tenant?, model, prompt, system?, max_output_tokens, request_id?}` → text, usage, reserved, `cost`, `charged_now`, `replayed`; errors below |
 | `GET` | `/v1/budgets/{tenant}` | today's limit, reserved, settled and remaining per scope |
 | `GET` | `/healthz` | liveness |
 
@@ -128,25 +128,55 @@ Both `/v1` routes take `Authorization: Bearer <credential>`, one of:
 - **the shared token** `SPEND_GUARD_API_TOKEN`, for one trusted caller that names the tenant in
   every request and may use any. Unset it once every client has its own key.
 
-With neither a shared token nor an active key, every request is refused (503). Prices, budgets
+A refused credential gets 401 `unauthorized`, whether or not keys exist. Only when there is no
+shared token and no active key (checked at most every 10 seconds) is the answer 503
+`api_disabled`: nothing could pass. Prices, budgets
 and keys can only be changed with the CLI, not over HTTP. A 402 names the scope that is
 exhausted, never another scope's amounts.
 
 ### Idempotent requests
 
-A client that may retry (its own timeout, a redelivered message) sends a `request_id` (UUID):
+A client that may retry (its own timeout, a redelivered message) sends a `request_id` (UUID).
+Ids are per tenant: another tenant's identical id is a different request and reveals nothing.
 
 | what happened to that id before | what a new request with it gets |
 |---|---|
 | nothing | normal processing; the id is claimed |
-| still in flight | **409**, try again later |
-| completed | the stored result, `"replayed": true`; no new reservation, no model call |
+| still in flight | **409** `request_in_flight` with `Retry-After: 5` |
+| completed | the stored result, `"replayed": true`, `"charged_now": "0.000000"`; no new reservation, no model call |
 | refused before any call (price, budget) or rejected by the provider before any work | normal processing: nothing was charged, so the id was freed |
-| failed in a way that may have been billed, or abandoned for 15 minutes | **409**, use a new id: an unknown outcome is never charged twice |
-| used for a different request (other tenant, model, prompt or settings) | **409** |
+| failed in a way that may have been billed, or abandoned (in flight over 15 minutes) | **409** `request_id_spent`: retry with a **new** id; an unknown outcome is never charged twice |
+| used for a different request (model, prompt, system or `max_output_tokens` differ) | **409** `request_id_conflict` |
 
-Stored results include the generated text; `llm-spend-guard idempotency-prune` removes finished
-entries (default: older than 24 hours).
+Every response carries `cost` (what the request cost) and `charged_now` (what this HTTP call
+added to the ledger: zero for a replay). Sum `charged_now`, not `cost`. If the result of a
+completed call cannot be stored, the caller still gets it; the id then answers
+`request_in_flight` and, after 15 minutes, `request_id_spent`.
+
+`llm-spend-guard idempotency-prune` marks abandoned requests as failed, forgets completed ids
+after 24 hours and failed ones after 30 days (`--completed-hours`, `--failed-days`). Inside
+those windows a redelivery is answered from the record; after them it would be processed (and
+charged) again, so keep the failed window longer than any redelivery your clients can produce.
+Stored results include the generated text.
+
+### Error codes
+
+Every error body is `{"detail": {"code": "...", "message": "..."}}`. Branch on `code`:
+
+| HTTP | `code` | what the client should do |
+|---|---|---|
+| 401 | `unauthorized` | fix the credential |
+| 503 | `api_disabled` | nothing is configured (no shared token, no active key); ask the operator |
+| 403 | `tenant_mismatch` | the key belongs to another tenant; use that tenant's key |
+| 403 | `no_budget` | no budget for this tenant; ask the operator |
+| 402 | `budget_exceeded` | wait for the next UTC day or a higher budget; do not retry now |
+| 409 | `no_checked_price` | the model has no current checked price; ask the operator, do not retry |
+| 409 | `request_in_flight` | retry the same request id after `Retry-After` seconds |
+| 409 | `request_id_spent` | retry with a new request id |
+| 409 | `request_id_conflict` | the id was used for another request; use a new id |
+| 422 | `invalid_request`, `tenant_required`, `invalid_tenant` | fix the request |
+| 502 | `provider_rejected` | the vendor refused before any work; nothing was charged; retrying may help (rate limit) |
+| 502 | `provider_failed` | the vendor failed and the call was charged at its worst case; retry with a new request id |
 
 ### Providers
 
@@ -154,14 +184,28 @@ entries (default: older than 24 hours).
 |---|---|---|
 | `mock` | offline, every test | deterministic token counts |
 | `gemini` | 10 live calls, recorded and replayed in CI (below) | `prompt_token_count` in; `candidates_token_count + thoughts_token_count` out |
-| `openai` | **fake clients only; never called against the real API** | Chat Completions: `prompt_tokens` in, `completion_tokens` out (already includes reasoning tokens); Responses API: `input_tokens` / `output_tokens` |
-| `anthropic` | **fake clients only; never called against the real API** | `input_tokens + 2 × cache_creation_input_tokens + cache_read_input_tokens` in; `output_tokens` out |
+| `openai` | **fake clients and the SDK's exception classes only; never called against the real API** | Chat Completions: `prompt_tokens` (+ 1.5 × `cache_write_tokens`) in, `completion_tokens` out (already includes reasoning tokens); Responses API: `input_tokens` (+ 1.5 × `cache_write_tokens`) / `output_tokens` |
+| `anthropic` | **fake clients and the SDK's exception classes only; never called against the real API** | `input_tokens + 2 × cache_creation_input_tokens + cache_read_input_tokens` in; `output_tokens` out |
 
-Cached input is billed by both vendors at a discount (reads) or a premium (Anthropic cache
-writes). The price book has one input rate, so the adapters convert on the safe side: cached
-reads count at the full input rate, Anthropic cache writes at twice it (the highest write
-multiplier in Anthropic's published pricing when this was written; not re-checked). The guard
-can over-count caching, never under-count it. The adapters never ask for caching themselves.
+**Caching.** The price book has one input rate per model; vendors bill cache writes above it
+and cache reads below it. The adapters charge cache writes at the highest multiplier the
+vendors' prompt-caching pages gave when they were read on 2026-11-08: 2.5× at OpenAI (1.25× for
+the default lifetime, 2.5× for the 12-hour one; OpenAI caches automatically) and 2× at Anthropic
+(1.25× for 5 minutes, 2× for 1 hour; opt-in, never requested here). Cache reads are charged at
+the full rate. Reservations scale the input bound by the same multiplier (2.5× for OpenAI, 2×
+for Anthropic), so a cache write cannot exceed a reservation. Assumptions: OpenAI's
+`cache_write_tokens` is read as part of `prompt_tokens`, like `cached_tokens` in the same
+breakdown (the SDK docstring does not say so); and the multipliers can change. Under those
+assumptions caching is over-counted, never under-counted.
+
+**Tier, speed, region, storage.** OpenAI requests ask for `service_tier="default"` and
+`store=False` (no stored prompts); Anthropic requests ask for `service_tier="standard_only"` and
+`speed="standard"`. A response that reports another tier or speed was served at a price the
+price book does not have: it is charged its full reservation and marked in the ledger. That
+reservation is computed at standard prices, so a vendor that billed a premium anyway would still
+be under-counted. Anthropic regions: with `SPEND_GUARD_ANTHROPIC_INFERENCE_GEO` set, that region
+is requested and required; without it, the workspace default applies and region pricing is not
+checked.
 
 Every vendor error is classified by HTTP status: 400, 401, 403, 404, 409, 413, 422 and 429 mean
 the vendor refused the request before generating anything, so the reservation is released;
@@ -212,6 +256,7 @@ re-records it (10 live calls, needs credentials).
 | `SPEND_GUARD_PROVIDER` | `mock` | `mock`, `gemini`, `openai`, `anthropic` or `replay` |
 | `SPEND_GUARD_MAX_LIVE_CALLS` | `0` | live providers: hard cap on calls per process; `0` makes none |
 | `SPEND_GUARD_OPENAI_API` | `chat` | `chat` (Chat Completions) or `responses`; credentials from `OPENAI_API_KEY` |
+| `SPEND_GUARD_ANTHROPIC_INFERENCE_GEO` | unset | region to request and require; credentials from `ANTHROPIC_API_KEY` |
 | `SPEND_GUARD_GEMINI_VERTEX` | unset | `true`: Vertex AI with Application Default Credentials and `GOOGLE_CLOUD_PROJECT`; else `GEMINI_API_KEY` |
 | `SPEND_GUARD_GEMINI_LOCATION`, `SPEND_GUARD_GEMINI_THINKING_LEVEL` | unset | Vertex location, thinking level |
 | `SPEND_GUARD_MAX_PRICE_AGE_DAYS` | `31` | older prices count as missing |

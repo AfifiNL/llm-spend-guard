@@ -40,5 +40,9 @@ class RequestInFlight(SpendGuardError):
 
 
 class RequestIdConflict(SpendGuardError):
-    """The client request_id was used for another request, or its request ended without a
-    result that can be replayed."""
+    """The tenant already used this client request_id for a different request."""
+
+
+class RequestIdSpent(SpendGuardError):
+    """The request with this id ended without a result that can be replayed (a failure that
+    may have been billed, or an abandoned request). Retry with a new request_id."""

@@ -17,11 +17,18 @@ class ProviderFailed(Exception):
 @dataclass(frozen=True)
 class ProviderResult:
     text: str
-    input_tokens: int
+    input_tokens: int  # input-rate-equivalent tokens (cache premiums already folded in)
     output_tokens: int  # everything billed at the output rate, including reasoning tokens
+    # Set when the response shows it was served in a way the price book does not price (a
+    # premium tier, another speed or region): the call is then charged at its full reservation.
+    unpriced_reason: str | None = None
 
 
 class Provider(Protocol):
+    """`input_rate_ceiling` (optional attribute, default 1.0): the highest multiple of the input
+    rate this provider can bill per input token (cache-write premiums). Reservations scale the
+    input bound by it, so a premium the vendor adds on its own cannot exceed a reservation."""
+
     name: str
 
     def complete(

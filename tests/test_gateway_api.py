@@ -208,7 +208,10 @@ def test_api_402_does_not_reveal_amounts(pool: ConnectionPool[Any], clock: Clock
         conn.execute("UPDATE budgets SET daily_limit_micros = 10 WHERE scope = 'global'")
     r = c.post("/v1/complete", headers=AUTH, json={"tenant": "acme", "model": "m1", "prompt": "hi"})
     assert r.status_code == 402
-    assert r.json()["detail"] == "daily budget reached for global"
+    assert r.json()["detail"] == {
+        "code": "budget_exceeded",
+        "message": "daily budget reached for global",
+    }
 
 
 def test_api_rejects_lone_surrogates(pool: ConnectionPool[Any], clock: Clock) -> None:

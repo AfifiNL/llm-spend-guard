@@ -131,8 +131,12 @@ def _cmd_idem_prune(a: argparse.Namespace) -> int:
     from spend_guard.idempotency import IdempotencyStore
 
     store = IdempotencyStore(_pool(), clock=lambda: dt.datetime.now(dt.UTC))
-    n = store.prune(dt.timedelta(hours=a.older_than_hours))
-    print(f"removed {n} finished request record(s)")
+    swept = store.sweep_stale()
+    n = store.prune(
+        keep_completed=dt.timedelta(hours=a.completed_hours),
+        keep_failed=dt.timedelta(days=a.failed_days),
+    )
+    print(f"marked {swept} abandoned request(s) as failed; removed {n} finished record(s)")
     return 0
 
 
@@ -248,8 +252,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("key-list", help="list keys (ids and tenants, never the keys)").set_defaults(
         fn=_cmd_key_list
     )
-    ip = sub.add_parser("idempotency-prune", help="forget finished client request ids")
-    ip.add_argument("--older-than-hours", type=int, default=24)
+    ip = sub.add_parser(
+        "idempotency-prune",
+        help="mark abandoned requests failed; forget completed ids after --completed-hours and"
+        " failed ones (may have been billed) after --failed-days",
+    )
+    ip.add_argument("--completed-hours", type=int, default=24)
+    ip.add_argument("--failed-days", type=int, default=30)
     ip.set_defaults(fn=_cmd_idem_prune)
     sub.add_parser("demo", help="offline demo with the mock model").set_defaults(fn=_cmd_demo)
     pr = sub.add_parser("probe", help="fixed prompts through the guard; checks the bound")
