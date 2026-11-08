@@ -1,0 +1,10 @@
+[
+  {
+    "model": "gemini-3.6-flash",
+    "input_per_mtok": "0.75",
+    "output_per_mtok": "3.75",
+    "currency": "USD",
+    "checked_at": "2026-11-08T21:25:00Z",
+    "source": "https://aistudio.google.com/docs/pricing, Standard tier, text input / output incl. thinking, valid through 2026-12-31 (Gemini Developer API page; the Vertex AI price was not checked)"
+  }
+]
