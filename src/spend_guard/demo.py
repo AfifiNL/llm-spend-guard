@@ -1,17 +1,19 @@
 """Offline demo: a mock model behind the guard, one tenant spending its daily budget until the
 guard warns at 80% and pauses, a model with no checked price refused, then the ledger, the
 trace spans and a reconciliation. Uses a throwaway local PostgreSQL unless
-SPEND_GUARD_DATABASE_URL is set (then it uses that database)."""
+SPEND_GUARD_DATABASE_URL is set; then it works in a scratch schema of that database and drops
+it afterwards, so real budgets, prices and ledger rows are never touched."""
 
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from spend_guard.db import make_pool
+from spend_guard.db import drop_schema, make_pool
 from spend_guard.errors import BudgetExceeded, NoCheckedPrice
 from spend_guard.gateway import SpendGuard
 from spend_guard.ledger import Alert, SpendLedger
@@ -23,7 +25,8 @@ PROMPT = "Summarise the attached support conversation in three bullet points for
 
 
 def run_demo() -> int:
-    pool = make_pool()
+    schema = f"spend_guard_demo_{uuid.uuid4().hex[:8]}"
+    pool = make_pool(schema=schema)  # never touches real budgets or ledger rows
     now = dt.datetime.now(dt.UTC)
     with pool.connection() as conn:
         add_price(
@@ -50,11 +53,11 @@ def run_demo() -> int:
     guard = SpendGuard(ledger, MockProvider(), tracer=tp.get_tracer("demo"))
 
     print("== price: mock-small 2.00 in / 8.00 out per 1M tokens; budget per tenant 0.005/day")
-    print(f"== {tenant} calls the model (max 200 output tokens each)")
-    for i in range(1, 13):
+    print(f"== {tenant} calls the model (max 60 output tokens each)")
+    for i in range(1, 17):
         n_alerts = len(alerts)
         try:
-            c = guard.complete(tenant, "mock-small", PROMPT, max_output_tokens=200)
+            c = guard.complete(tenant, "mock-small", PROMPT, max_output_tokens=60)
             line = f"   call {i:2}: reserved {fmt(c.reserved_micros)}  charged {fmt(c.cost_micros)}"
         except BudgetExceeded as exc:
             line = f"   call {i:2}: REFUSED before the call: {exc}"
@@ -66,7 +69,7 @@ def run_demo() -> int:
         print(line)
     print("== a model without a checked price")
     try:
-        guard.complete(tenant, "mock-large", PROMPT, max_output_tokens=200)
+        guard.complete(tenant, "mock-large", PROMPT, max_output_tokens=60)
     except NoCheckedPrice as exc:
         print(f"   REFUSED: {exc}")
     print("== status")
@@ -85,5 +88,6 @@ def run_demo() -> int:
         )
     problems = ledger.reconcile(now.date())
     print("== reconcile: " + ("ledger and counters agree" if not problems else str(problems)))
+    drop_schema(pool, schema)
     pool.close()
     return 1 if problems else 0

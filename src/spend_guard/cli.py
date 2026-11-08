@@ -104,47 +104,67 @@ def _cmd_demo(_: argparse.Namespace) -> int:
     return run_demo()
 
 
+def probe_clock(meta: dict[str, Any]) -> dt.datetime:
+    """A replay runs at the time it was recorded, so the price that was checked then is still
+    "fresh" for it, however long after the recording CI runs."""
+    stamp = str(meta.get("recorded_at", ""))
+    if not stamp:
+        raise ValueError("cassette has no recorded_at; re-record it")
+    return dt.datetime.fromisoformat(stamp.replace("Z", "+00:00")) + dt.timedelta(minutes=1)
+
+
 def _cmd_probe(a: argparse.Namespace) -> int:
+    import uuid
+
+    from spend_guard.db import drop_schema, make_pool
     from spend_guard.factory import build_provider
     from spend_guard.gateway import SpendGuard
     from spend_guard.ledger import SpendLedger
     from spend_guard.probe import run_probe, seed_prices, table
     from spend_guard.providers.replay import RecordingProvider, ReplayProvider
 
-    pool = _pool()
-    with pool.connection() as conn:
-        seed_prices(conn, Path(a.prices))
-        conn.execute(
-            "INSERT INTO budgets (scope, daily_limit_micros) VALUES ('global', %s),"
-            " ('tenant:probe', %s) ON CONFLICT (scope) DO NOTHING",
-            (parse("1.00"), parse("1.00")),
-        )
-    provider = build_provider()
-    record = os.environ.get("SPEND_GUARD_RECORD_CASSETTE")
-    if record:
-        meta = {
-            "model": "gemini-3.6-flash",
-            "thinking_level": os.environ.get("SPEND_GUARD_GEMINI_THINKING_LEVEL", ""),
-            "location": os.environ.get("SPEND_GUARD_GEMINI_LOCATION", ""),
-            "recorded_at": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:00Z"),
-        }
-        provider = RecordingProvider(provider, Path(record), meta)
-    ledger = SpendLedger(pool)
-    rows = run_probe(SpendGuard(ledger, provider))
-    print(table(rows))
-    if isinstance(provider, RecordingProvider):
-        provider.save()
-        print(f"recorded {len(provider.rows)} calls to {record}")
-    if isinstance(provider, ReplayProvider) and provider.misses:
-        print(f"REPLAY MISS: {provider.misses}")
-        return 1
-    problems = ledger.reconcile(dt.datetime.now(dt.UTC).date())
-    over = [r.label for r in rows if r.cost_micros > r.reserved_micros]
-    if problems or over:
-        print(f"FAILED: reconcile {problems}, overruns {over}")
-        return 1
-    print("probe passed: every call settled within its reservation; ledger reconciles")
-    return 0
+    schema = f"spend_guard_probe_{uuid.uuid4().hex[:8]}"
+    pool = make_pool(schema=schema)  # a scratch schema: never the real budgets or ledger
+    try:
+        with pool.connection() as conn:
+            seed_prices(conn, Path(a.prices))
+            conn.execute(
+                "INSERT INTO budgets (scope, daily_limit_micros) VALUES ('global', %s),"
+                " ('tenant:probe', %s)",
+                (parse("1.00"), parse("1.00")),
+            )
+        provider = build_provider()
+        clock_now = dt.datetime.now(dt.UTC)
+        if isinstance(provider, ReplayProvider):
+            clock_now = probe_clock(provider.meta)
+        record = os.environ.get("SPEND_GUARD_RECORD_CASSETTE")
+        if record:
+            meta = {
+                "model": "gemini-3.6-flash",
+                "thinking_level": os.environ.get("SPEND_GUARD_GEMINI_THINKING_LEVEL", ""),
+                "location": os.environ.get("SPEND_GUARD_GEMINI_LOCATION", ""),
+                "recorded_at": clock_now.strftime("%Y-%m-%dT%H:%M:00Z"),
+            }
+            provider = RecordingProvider(provider, Path(record), meta)
+        ledger = SpendLedger(pool, clock=lambda: clock_now)
+        rows = run_probe(SpendGuard(ledger, provider))
+        print(table(rows))
+        if isinstance(provider, RecordingProvider):
+            provider.save()
+            print(f"recorded {len(provider.rows)} calls to {record}")
+        if isinstance(provider, ReplayProvider) and provider.misses:
+            print(f"REPLAY MISS: {provider.misses}")
+            return 1
+        problems = ledger.reconcile(clock_now.date())
+        over = [r.label for r in rows if r.cost_micros > r.reserved_micros]
+        if problems or over:
+            print(f"FAILED: reconcile {problems}, overruns {over}")
+            return 1
+        print("probe passed: every call settled within its reservation; ledger reconciles")
+        return 0
+    finally:
+        drop_schema(pool, schema)
+        pool.close()
 
 
 def _cmd_serve(a: argparse.Namespace) -> int:  # pragma: no cover - runs a server

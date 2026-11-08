@@ -35,10 +35,28 @@ added in between. During development the guard refused the live probe once becau
 had been dated a few minutes in the future: the rule works as intended, including against its
 author.
 
+**Alerts follow money, refusals follow holds.** The 80% warning compares settled spend with the
+limit: a large temporary hold is not spending. A refusal records a `pause` alert at once, and so
+does settled spend reaching the limit. Alerts are rows written in the same transaction, and the
+callback runs after commit; a failing callback is logged and never undoes or hides a charge.
+
 **Unknown usage is charged in full.** A provider error that may have been billed (timeout,
 server error, a response without usage) settles at the reserved amount. Only errors that
 certainly happened before any work (400/401/403/404/429) release the hold. Over-counting is the
-safe direction for a budget. Abandoned reservations get the same treatment from `sweep`.
+safe direction for a budget. Abandoned reservations get the same treatment from `sweep`. A call
+that settles after its reservation was swept still records its real usage: anything above the
+worst case is charged and marked as an overrun, and nothing below it is refunded.
+
+**Who may write.** Triggers reject `UPDATE`, `DELETE` and `TRUNCATE` on the ledger and edits to
+the price book, but a table owner can disable triggers. In production, migrate as an owner role
+and run the service as another:
+
+```sql
+GRANT SELECT, INSERT ON ledger, price_book, reservations, alerts TO spend_guard_app;
+GRANT SELECT, INSERT, UPDATE ON spend_day, reservations TO spend_guard_app;
+GRANT SELECT ON budgets TO spend_guard_app;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO spend_guard_app;
+```
 
 **Integer micro-units, rounded up.** No floats anywhere in money paths. Prices are per million
 tokens in micros; a cost is `ceil((in × p_in + out × p_out) / 1e6)`.

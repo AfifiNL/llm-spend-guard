@@ -101,15 +101,20 @@ def test_global_budget_caps_all_tenants(pool: ConnectionPool[Any], clock: Clock)
     assert info.value.scope == "global"
 
 
-def test_alerts_at_80_percent_and_on_pause(pool: ConnectionPool[Any], clock: Clock) -> None:
+def test_alerts_follow_settled_spend_and_refusals(pool: ConnectionPool[Any], clock: Clock) -> None:
     setup_prices_and_budgets(pool, global_limit=10_000_000, tenant_default=10_000)
     seen: list[Alert] = []
     ledger = SpendLedger(pool, clock=clock, on_alert=seen.append)
-    ledger.reserve("acme", "m1", max_input_tokens=7000, max_output_tokens=1)  # 7002: < 80%
+    # A large hold alone raises no alert: holds are temporary.
+    r = ledger.reserve("acme", "m1", max_input_tokens=9000, max_output_tokens=1)
     assert seen == []
-    ledger.reserve("acme", "m1", max_input_tokens=1000, max_output_tokens=1)  # 8004: >= 80%
+    ledger.settle(r.request_id, 7000, 0)  # settled 7,000 of 10,000: below 80%
+    assert seen == []
+    r = ledger.reserve("acme", "m1", max_input_tokens=1000, max_output_tokens=1)
+    ledger.settle(r.request_id, 1000, 0)  # settled 8,000: 80%
     assert [(a.scope, a.level) for a in seen] == [("tenant:acme", "warn")]
-    ledger.reserve("acme", "m1", max_input_tokens=100, max_output_tokens=1)  # warn only once
+    r = ledger.reserve("acme", "m1", max_input_tokens=100, max_output_tokens=1)
+    ledger.settle(r.request_id, 100, 0)  # warns only once a day
     assert len(seen) == 1
     with pytest.raises(BudgetExceeded):
         ledger.reserve("acme", "m1", max_input_tokens=5000, max_output_tokens=1)
@@ -117,6 +122,37 @@ def test_alerts_at_80_percent_and_on_pause(pool: ConnectionPool[Any], clock: Clo
         ("tenant:acme", "warn"),
         ("tenant:acme", "pause"),
     ]
+    assert [a.level for a in ledger.alerts()] == ["warn", "pause"]
+
+
+def test_pause_alert_when_settled_spend_reaches_the_limit(
+    pool: ConnectionPool[Any], clock: Clock
+) -> None:
+    setup_prices_and_budgets(pool, global_limit=10_000_000, tenant_default=10_000)
+    seen: list[Alert] = []
+    ledger = SpendLedger(pool, clock=clock, on_alert=seen.append)
+    r = ledger.reserve("acme", "m1", max_input_tokens=9_998, max_output_tokens=1)  # 10,000
+    ledger.settle(r.request_id, 10_000, 0)  # settled exactly 100%
+    assert [a.level for a in seen] == ["warn", "pause"]
+    with pytest.raises(BudgetExceeded):  # the next call is refused; no duplicate alert
+        ledger.reserve("acme", "m1", max_input_tokens=1, max_output_tokens=1)
+    assert [a.level for a in seen] == ["warn", "pause"]
+
+
+def test_a_failing_alert_callback_never_breaks_a_call(
+    pool: ConnectionPool[Any], clock: Clock
+) -> None:
+    setup_prices_and_budgets(pool, global_limit=10_000_000, tenant_default=1_000)
+
+    def boom(_: Alert) -> None:
+        raise RuntimeError("pager down")
+
+    ledger = SpendLedger(pool, clock=clock, on_alert=boom)
+    r = ledger.reserve("acme", "m1", max_input_tokens=900, max_output_tokens=1)
+    s = ledger.settle(r.request_id, 900, 0)  # crosses 80%: the callback fails, settle doesn't
+    assert s.cost_micros == 900
+    with pytest.raises(BudgetExceeded):
+        ledger.reserve("acme", "m1", max_input_tokens=500, max_output_tokens=1)
     assert [a.level for a in ledger.alerts()] == ["warn", "pause"]
 
 
@@ -157,8 +193,73 @@ def test_sweep_charges_abandoned_reservations(ledger: SpendLedger, clock: Clock)
     assert ledger.sweep(dt.timedelta(minutes=10)) == 0
     clock.now = NOW + dt.timedelta(minutes=11)
     assert ledger.sweep(dt.timedelta(minutes=10)) == 1
+    assert ledger.status("acme")[1].settled_micros == 3000
     with pytest.raises(UnknownReservation):
+        ledger.settle_worst_case(r.request_id, "twice")
+    assert ledger.reconcile(NOW.date()) == []
+
+
+def test_late_settlement_after_a_sweep_records_the_overrun(
+    ledger: SpendLedger, clock: Clock, pool: ConnectionPool[Any]
+) -> None:
+    r = ledger.reserve("acme", "m1", max_input_tokens=10, max_output_tokens=10)  # 30 micros
+    clock.now = NOW + dt.timedelta(minutes=30)
+    assert ledger.sweep(dt.timedelta(minutes=10)) == 1  # charged the 30 worst case
+    late = ledger.settle(r.request_id, 5000, 1000)  # the slow call really cost 7,000
+    assert late.overrun
+    assert late.cost_micros == 7000
+    assert ledger.status("acme")[1].settled_micros == 7000
+    with pool.connection() as conn:
+        notes = [n for (n,) in conn.execute("SELECT note FROM ledger ORDER BY id").fetchall()]
+    assert "late settlement after sweep" in notes[-1]
+    assert "overrun" in notes[-1]
+    with pytest.raises(UnknownReservation):  # a second settle is refused
         ledger.settle(r.request_id, 1, 1)
+    assert ledger.reconcile(NOW.date()) == []
+
+
+def test_late_settlement_below_the_swept_charge_refunds_nothing(
+    ledger: SpendLedger, clock: Clock
+) -> None:
+    r = ledger.reserve("acme", "m1", max_input_tokens=1000, max_output_tokens=1000)  # 3,000
+    clock.now = NOW + dt.timedelta(minutes=30)
+    ledger.sweep(dt.timedelta(minutes=10))
+    s = ledger.settle(r.request_id, 10, 10)
+    assert not s.overrun
+    assert ledger.status("acme")[1].settled_micros == 3000
+    assert ledger.reconcile(NOW.date()) == []
+
+
+def test_currency_must_match_the_budgets(pool: ConnectionPool[Any], clock: Clock) -> None:
+    setup_prices_and_budgets(pool)
+    with pool.connection() as conn:
+        add_price(conn, "eur-model", 1, 1, checked_at=NOW, source="x", currency="EUR")
+    ledger = SpendLedger(pool, clock=clock)
+    with pytest.raises(NoCheckedPrice, match="EUR"):
+        ledger.reserve("acme", "eur-model", max_input_tokens=1, max_output_tokens=1)
+
+
+def test_zero_budget_blocks_even_free_models(pool: ConnectionPool[Any], clock: Clock) -> None:
+    setup_prices_and_budgets(pool, tenants={"frozen": 0})
+    with pool.connection() as conn:
+        add_price(conn, "free", 0, 0, checked_at=NOW, source="x")
+    ledger = SpendLedger(pool, clock=clock)
+    with pytest.raises(BudgetExceeded):
+        ledger.reserve("frozen", "free", max_input_tokens=1, max_output_tokens=1)
+
+
+def test_prices_cannot_be_edited(ledger: SpendLedger, pool: ConnectionPool[Any]) -> None:
+    with pool.connection() as conn:
+        for sql in ("UPDATE price_book SET input_per_mtok_micros = 0", "DELETE FROM price_book"):
+            with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
+                conn.execute(sql)
+
+
+def test_large_token_counts(ledger: SpendLedger, pool: ConnectionPool[Any]) -> None:
+    with pool.connection() as conn:
+        conn.execute("UPDATE budgets SET daily_limit_micros = 10000000000000")
+    r = ledger.reserve("acme", "m1", max_input_tokens=3_000_000_000, max_output_tokens=1)
+    assert ledger.settle(r.request_id, 3_000_000_000, 0).cost_micros == 3_000_000_000
 
 
 def test_ledger_is_append_only(ledger: SpendLedger, pool: ConnectionPool[Any]) -> None:

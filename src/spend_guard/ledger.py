@@ -21,6 +21,7 @@ checks; `reconcile()` recomputes them from the ledger and reports any difference
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -29,9 +30,11 @@ from typing import Any
 import psycopg
 from psycopg_pool import ConnectionPool
 
-from spend_guard.errors import BudgetExceeded, NoBudget, UnknownReservation
+from spend_guard.errors import BudgetExceeded, NoBudget, NoCheckedPrice, UnknownReservation
 from spend_guard.money import cost_micros
 from spend_guard.prices import Price, current_price
+
+log = logging.getLogger("spend_guard")
 
 GLOBAL = "global"
 DEFAULT_TENANT = "tenant:*"
@@ -47,7 +50,9 @@ def tenant_scope(tenant: str) -> str:
 class Alert:
     scope: str
     day: dt.date
-    level: str  # "warn" (>= warn ratio) | "pause" (a call was refused, or 100% reached)
+    level: str  # "warn": settled spend reached the warn ratio; "pause": a call was refused,
+    #              or settled spend reached the limit
+
     spent_micros: int
     limit_micros: int
 
@@ -94,9 +99,11 @@ class SpendLedger:
         max_price_age: dt.timedelta = dt.timedelta(days=31),
         warn_ratio: float = 0.8,
         on_alert: Callable[[Alert], None] | None = None,
+        currency: str = "USD",
     ) -> None:
         if not 0 < warn_ratio < 1:
             raise ValueError("warn_ratio must be between 0 and 1")
+        self.currency = currency
         self.pool = pool
         self.clock = clock
         self.max_price_age = max_price_age
@@ -167,9 +174,14 @@ class SpendLedger:
         return raised
 
     def _notify(self, alerts: list[Alert]) -> None:
+        """Called after commit. A failing callback is logged and never reaches the caller:
+        the money is already reserved or settled, and every alert is still in the table."""
         if self.on_alert:
             for a in alerts:
-                self.on_alert(a)
+                try:
+                    self.on_alert(a)
+                except Exception:
+                    log.exception("on_alert failed for %s %s %s", a.scope, a.day, a.level)
 
     # ── public API ───────────────────────────────────────────────────────────
     def reserve(
@@ -190,6 +202,10 @@ class SpendLedger:
         alerts: list[Alert] = []
         with self.pool.connection() as conn, conn.transaction():
             price = current_price(conn, model, now=now, max_age=self.max_price_age)
+            if price.currency != self.currency:
+                raise NoCheckedPrice(
+                    f"price for {model!r} is in {price.currency}; budgets are in {self.currency}"
+                )
             amount = cost_micros(
                 max_input_tokens,
                 max_output_tokens,
@@ -200,7 +216,7 @@ class SpendLedger:
             counters = self._lock_counters(conn, list(limits), day)
             for scope in sorted(limits):
                 reserved, settled = counters[scope]
-                if reserved + settled + amount > limits[scope]:
+                if limits[scope] == 0 or reserved + settled + amount > limits[scope]:
                     refused = BudgetExceeded(scope, reserved + settled, amount, limits[scope])
                     a = Alert(scope, day, "pause", reserved + settled, limits[scope])
                     if self._alert(conn, a):
@@ -223,10 +239,6 @@ class SpendLedger:
                     " WHERE day = %s AND scope = ANY(%s)",
                     (amount, day, sorted(limits)),
                 )
-                totals = {s: counters[s][0] + counters[s][1] + amount for s in limits}
-                alerts += [
-                    a for a in self._thresholds(conn, day, limits, totals) if a.level == "warn"
-                ]
         self._notify(alerts)
         if refused is not None:
             raise refused
@@ -241,6 +253,7 @@ class SpendLedger:
         input_tokens: int | None,
         output_tokens: int | None,
         note: str,
+        final_state: str | None = None,
     ) -> Settlement:
         now = self.clock()
         alerts: list[Alert] = []
@@ -250,7 +263,13 @@ class SpendLedger:
                 " FROM reservations WHERE request_id = %s FOR UPDATE",
                 (request_id,),
             ).fetchone()
-            if row is None or row[6] != "open":
+            late = (
+                row is not None
+                and row[6] == "swept"
+                and kind == "settle"
+                and input_tokens is not None
+            )
+            if row is None or (row[6] != "open" and not late):
                 state = "missing" if row is None else row[6]
                 raise UnknownReservation(f"reservation {request_id} is {state}")
             tenant, day, model, price_id, scopes, reserved = row[:6]
@@ -260,19 +279,29 @@ class SpendLedger:
                 (price_id,),
             ).fetchone()
             assert prow is not None  # noqa: S101 - foreign key guarantees it
-            charged = cost(Price(*prow), int(reserved)) if cost else 0
+            actual = cost(Price(*prow), int(reserved)) if cost else 0
             counters = self._lock_counters(conn, list(scopes), day)
+            if late:
+                # The sweep already charged the full reservation. Record the real usage; charge
+                # only what exceeds the reservation (an overrun), never refund below it.
+                charged, released = max(0, actual - int(reserved)), 0
+                note = (note + "; " if note else "") + (
+                    f"late settlement after sweep: actual {actual}, already charged {reserved}"
+                )
+            else:
+                charged, released = actual, int(reserved)
             conn.execute(
                 "UPDATE spend_day SET reserved_micros = reserved_micros - %s,"
                 " settled_micros = settled_micros + %s WHERE day = %s AND scope = ANY(%s)",
-                (reserved, charged, day, list(scopes)),
+                (released, charged, day, list(scopes)),
             )
+            state = final_state or ("released" if kind == "release" else "settled")
             conn.execute(
                 "UPDATE reservations SET state = %s, closed_at = %s WHERE request_id = %s",
-                ("released" if kind == "release" else "settled", now, request_id),
+                (state, now, request_id),
             )
-            if charged > reserved:
-                note = (note + "; " if note else "") + f"overrun: charged {charged} > {reserved}"
+            if actual > reserved:
+                note = (note + "; " if note else "") + f"overrun: actual {actual} > {reserved}"
             conn.execute(
                 "INSERT INTO ledger (request_id, tenant, day, model, price_id, kind,"
                 " amount_micros, released_micros, input_tokens, output_tokens, note)"
@@ -285,7 +314,7 @@ class SpendLedger:
                     price_id,
                     kind,
                     charged,
-                    reserved,
+                    released,
                     input_tokens,
                     output_tokens,
                     note,
@@ -296,17 +325,18 @@ class SpendLedger:
                 if limits.get(f"tenant:{tenant}") is None:
                     limits[f"tenant:{tenant}"] = self._limit(conn, DEFAULT_TENANT)
                 known = {s: v for s, v in limits.items() if v is not None}
-                totals = {
-                    s: counters[s][0] - int(reserved) + counters[s][1] + charged for s in known
-                }
+                # Alerts follow settled spend, not temporary holds.
+                totals = {s: counters[s][1] + charged for s in known}
                 alerts = self._thresholds(conn, day, known, totals)
         self._notify(alerts)
-        return Settlement(request_id, charged, int(reserved))
+        total_charged = int(reserved) + charged if late else charged
+        return Settlement(request_id, max(actual, total_charged), int(reserved))
 
     def settle(
         self, request_id: uuid.UUID, input_tokens: int, output_tokens: int, note: str = ""
     ) -> Settlement:
-        """Charge the actual cost from the provider's reported usage."""
+        """Charge the actual cost from the provider's reported usage. On a reservation the sweep
+        already charged, this records the real usage and charges any overrun beyond it."""
         if input_tokens < 0 or output_tokens < 0:
             raise ValueError("usage must be non-negative")
         return self._close(
@@ -320,9 +350,12 @@ class SpendLedger:
             note=note,
         )
 
-    def settle_worst_case(self, request_id: uuid.UUID, note: str) -> Settlement:
+    def settle_worst_case(
+        self, request_id: uuid.UUID, note: str, *, swept: bool = False
+    ) -> Settlement:
         """Usage is unknown (timeout, crash, a server error after the request was sent):
-        charge the full reservation. Over-counting is the safe direction for a budget."""
+        charge the full reservation. Over-counting is the safe direction for a budget. A swept
+        reservation can still receive its real usage later (see `settle`)."""
         return self._close(
             request_id,
             kind="settle",
@@ -330,6 +363,7 @@ class SpendLedger:
             input_tokens=None,
             output_tokens=None,
             note=note,
+            final_state="swept" if swept else None,
         )
 
     def release(self, request_id: uuid.UUID, note: str = "") -> Settlement:
@@ -359,7 +393,7 @@ class SpendLedger:
         closed = 0
         for rid in ids:
             try:
-                self.settle_worst_case(rid, "swept: no settlement in time")
+                self.settle_worst_case(rid, "swept: no settlement in time", swept=True)
                 closed += 1
             except UnknownReservation:
                 continue  # settled concurrently

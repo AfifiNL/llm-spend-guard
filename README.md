@@ -7,12 +7,13 @@ its limit is refused before it is made, and so is a call to a model without a ch
 
 - **Reserve, then settle**, in transactions that lock the day's counters: concurrent calls can
   never both fit into the same remaining budget.
-- **No checked price, no call**: every price is a dated, sourced row; a missing, stale or
-  future-dated price refuses the call.
-- **Alerts** once per scope and day at 80% (configurable), and a **pause** record when a call is
-  refused.
-- **Append-only ledger** (enforced by triggers), running totals for fast checks, and a
-  `reconcile` that recomputes the totals from the ledger.
+- **No checked price, no call**: every price is a dated, sourced row in the budgets' currency.
+  No price, or only one older than 31 days, refuses the call; a price dated in the future is
+  not used until its date.
+- **Alerts** once per scope and day when settled spend reaches 80% (configurable), and a
+  **pause** alert when a call is refused or settled spend reaches 100%.
+- **Append-only ledger and price book** (triggers reject edits), running totals for fast
+  checks, and a `reconcile` that recomputes the totals from the ledger.
 - **OpenTelemetry spans** per call with the GenAI attributes and the reserved and charged
   amounts, for any exporter.
 - **Mock provider**, so the demo and the tests spend nothing; a Gemini adapter; and a recorded
@@ -24,37 +25,41 @@ its limit is refused before it is made, and so is a call to a model without a ch
 
 ```text
 == price: mock-small 2.00 in / 8.00 out per 1M tokens; budget per tenant 0.005/day
-== team-212517 calls the model (max 200 output tokens each)
-   call  1: reserved 0.001906  charged 0.000296
+== team-214326 calls the model (max 60 output tokens each)
+   call  1: reserved 0.000786  charged 0.000296
    ...
-   call  9: reserved 0.001906  charged 0.000296
-           ALERT warn on tenant:team-212517: 0.004274 of 0.005000
-   call 10: reserved 0.001906  charged 0.000296
-   call 11: reserved 0.001906  charged 0.000296
-   call 12: REFUSED before the call: tenant:team-212517: 0.003256 spent or reserved + 0.001906 worst case for this call > 0.005000 daily limit
-           ALERT pause on tenant:team-212517: 0.003256 of 0.005000
+   call 14: reserved 0.000786  charged 0.000296
+           ALERT warn on tenant:team-214326: 0.004144 of 0.005000
+   call 15: reserved 0.000786  charged 0.000296
+   call 16: REFUSED before the call: tenant:team-214326: 0.004440 spent or reserved + 0.000786 worst case for this call > 0.005000 daily limit
+           ALERT pause on tenant:team-214326: 0.004440 of 0.005000
 == a model without a checked price
    REFUSED: no checked price for model 'mock-large': add one to the price book
+== status
+   global: settled 0.004440, reserved 0.000000, remaining 0.045560 of 0.050000
+   tenant:team-214326: settled 0.004440, reserved 0.000000, remaining 0.000560 of 0.005000
 == trace spans (any OpenTelemetry exporter can ship these)
-   llm.complete: outcome=ok reserved=1906 cost=296 model=mock-small
+   llm.complete: outcome=ok reserved=786 cost=296 model=mock-small
    llm.complete: outcome=refused_budget reserved=None cost=None model=mock-small
    llm.complete: outcome=refused_no_price reserved=None cost=None model=mock-large
 == reconcile: ledger and counters agree
 ```
 
-Call 12 shows the trade-off this design makes on purpose: the tenant had spent 0.003256 of
-0.005, but the call's worst case (0.001906) no longer fit, so it was refused. A guarantee that
-the limit holds costs some headroom.
+Call 16 shows the trade-off this design makes on purpose: the tenant had spent 0.004440 of
+0.005, but the call's worst case (0.000786) no longer fit, so it was refused. A guarantee that
+the limit holds costs some headroom; the larger `max_output_tokens`, the more.
 
 ## Quick start
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). No database setup: without
-`SPEND_GUARD_DATABASE_URL`, a pip-packaged PostgreSQL is started in a temporary directory.
+`SPEND_GUARD_DATABASE_URL`, a pip-packaged PostgreSQL 16 is started in a temporary directory.
+With your own database, PostgreSQL 14 or newer; the demo and the probe then work in a scratch
+schema that they drop afterwards, so they never touch real budgets, prices or ledger rows.
 
 ```bash
 make install    # .venv with extras, dev tools and the local PostgreSQL (locked)
 make demo       # the run above
-make check      # lint, strict types, 43 tests on PostgreSQL, probe replay, demo (what CI runs)
+make check      # lint, strict types, 57 tests on PostgreSQL, probe replay, demo (what CI runs)
 ```
 
 With your own PostgreSQL:
@@ -99,7 +104,8 @@ settle ─── actual = price × reported usage, rounded up to the micro-unit;
 - **Money** is integer micro-units of the price book's currency; costs round up.
 - **Fail closed.** No global budget, or no budget for the tenant and no default: refused.
 - **Abandoned reservations** (a caller crashed between reserve and settle) are charged at their
-  worst case by `llm-spend-guard sweep`.
+  worst case by `llm-spend-guard sweep`. If the slow call then settles after all, its real usage
+  is recorded and anything above the worst case is charged as an overrun; nothing is refunded.
 
 ### HTTP API
 
@@ -110,7 +116,8 @@ settle ─── actual = price × reported usage, rounded up to the micro-unit;
 | `GET` | `/healthz` | liveness |
 
 Both `/v1` routes need `Authorization: Bearer $SPEND_GUARD_API_TOKEN`; without the variable they
-refuse everything. Prices and budgets can only be changed with the CLI, not over HTTP.
+refuse everything. Prices and budgets can only be changed with the CLI, not over HTTP. A 402
+names the scope that is exhausted, never another scope's amounts.
 
 ## Live probe (Gemini)
 
@@ -144,8 +151,9 @@ published standard-tier price on that date):
   price was not checked separately. The amounts are what the ledger computed, not an invoice.
 
 The recording is in `evals/fixtures/live-probe.jsonl`. `make probe-replay` (part of `make
-check`) replays it through a fresh ledger in CI and fails on any overrun, replay miss or
-reconciliation difference. `make record-live` re-records it (10 live calls, needs credentials).
+check`) replays it through a fresh ledger, at the time it was recorded so the price stays valid,
+and fails on any overrun, replay miss or reconciliation difference. `make record-live`
+re-records it (10 live calls, needs credentials).
 
 ## Configuration
 
@@ -163,16 +171,23 @@ reconciliation difference. `make record-live` re-records it (10 live calls, need
 ## Limits
 
 - **One provider adapter (Gemini) besides the mock.** The provider interface is three lines;
-  OpenAI and Anthropic adapters are not included and nothing here was run against them.
+  OpenAI and Anthropic adapters are not included and nothing here was run against them. Errors
+  without an HTTP status (for example missing credentials) are charged the worst case.
 - **Text only.** The input bound assumes text; images, audio and cached-token discounts are not
   modelled. Prices are per model, one input and one output rate, no tiers by prompt length.
-- **Days are UTC days.** No monthly budgets, no per-user or per-key budgets beyond tenants.
+- **Days are UTC days, one currency.** No monthly budgets; prices in another currency than the
+  ledger's are refused, not converted.
+- **The tenant is whatever the caller says.** Anyone holding the API token can spend any
+  tenant's budget, and a new tenant id gets the default budget; only the global budget is a
+  hard ceiling. Tie tenants to credentials in front of the API before serving several clients.
+- **Triggers stop accidents, not the table owner.** The owner can disable a trigger. Run the
+  service as a role with only `SELECT, INSERT` on `ledger` and `price_book` (DESIGN.md).
 - **Worst-case reservations refuse calls that would have fit.** Tight budgets with large
   `max_output_tokens` pause early (see the demo).
 - **Alerts are rows and a callback**, not e-mails or pages; wire `on_alert` to your own channel.
 - **One shared API token**; put your own authentication in front before exposing it.
 - **Not load-tested.** Correctness under concurrency is tested (16 threads, 48 attempts, no
-  overshoot); throughput is not measured.
+  overshoot); throughput is not measured. CI runs PostgreSQL 17, local runs 16.
 
 ## License
 

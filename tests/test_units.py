@@ -27,7 +27,7 @@ def test_parse_and_fmt(text: str, micros: int) -> None:
     assert parse(fmt(micros)) == micros
 
 
-@pytest.mark.parametrize("bad", ["0.0000001", "abc", "1.2.3", ""])
+@pytest.mark.parametrize("bad", ["0.0000001", "abc", "1.2.3", "", "+-5", "\u0663", "."])
 def test_parse_rejects(bad: str) -> None:
     with pytest.raises(ValueError, match=r"amount|decimals"):
         parse(bad)

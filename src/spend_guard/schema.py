@@ -1,4 +1,9 @@
-"""PostgreSQL schema. `migrate` is idempotent and safe to run on every start."""
+"""PostgreSQL schema (PostgreSQL 14 or newer). `migrate` is idempotent and safe to run on every
+start.
+
+The triggers stop accidental edits, not a hostile table owner: the owner can disable a trigger.
+Run the service under a role that has only SELECT and INSERT on `ledger` and `price_book`
+(see docs/DESIGN.md)."""
 
 from __future__ import annotations
 
@@ -44,7 +49,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     budget_scopes    TEXT[] NOT NULL,
     reserved_micros  BIGINT NOT NULL CHECK (reserved_micros >= 0),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    state            TEXT NOT NULL CHECK (state IN ('open', 'settled', 'released')),
+    state            TEXT NOT NULL CHECK (state IN ('open', 'settled', 'released', 'swept')),
     closed_at        TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS reservations_open ON reservations (created_at) WHERE state = 'open';
@@ -60,17 +65,20 @@ CREATE TABLE IF NOT EXISTS ledger (
     kind           TEXT NOT NULL CHECK (kind IN ('reserve', 'settle', 'release')),
     amount_micros  BIGINT NOT NULL CHECK (amount_micros >= 0),
     released_micros BIGINT NOT NULL DEFAULT 0 CHECK (released_micros >= 0),
-    input_tokens   INTEGER,
-    output_tokens  INTEGER,
+    input_tokens   BIGINT,
+    output_tokens  BIGINT,
     note           TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ledger_request ON ledger (request_id);
 
 CREATE OR REPLACE FUNCTION ledger_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE EXCEPTION 'ledger is append-only';
+    RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
 END
 $$;
+-- Prices are never edited: a new price is a new row, so settlement and history stay exact.
+CREATE OR REPLACE TRIGGER price_book_no_update_delete BEFORE UPDATE OR DELETE ON price_book
+    FOR EACH ROW EXECUTE FUNCTION ledger_append_only();
 CREATE OR REPLACE TRIGGER ledger_no_update_delete BEFORE UPDATE OR DELETE ON ledger
     FOR EACH ROW EXECUTE FUNCTION ledger_append_only();
 CREATE OR REPLACE TRIGGER ledger_no_truncate BEFORE TRUNCATE ON ledger

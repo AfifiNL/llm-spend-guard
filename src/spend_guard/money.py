@@ -4,6 +4,8 @@ caller."""
 
 from __future__ import annotations
 
+import re
+
 MICROS = 1_000_000
 
 
@@ -24,11 +26,12 @@ def fmt(micros: int) -> str:
 def parse(amount: str) -> int:
     """'1.5' -> 1_500_000. Rejects more than 6 decimals instead of rounding silently."""
     s = amount.strip()
-    neg = s.startswith("-")
-    whole, _, frac = s.lstrip("+-").partition(".")
-    if not whole.isdigit() and not (whole == "" and frac):
+    m = re.fullmatch(r"([+-]?)([0-9]*)(?:\.([0-9]*))?", s, re.ASCII)
+    if not m or not (m.group(2) or m.group(3)):
         raise ValueError(f"not an amount: {amount!r}")
-    if len(frac) > 6 or (frac and not frac.isdigit()):
+    neg = m.group(1) == "-"
+    whole, frac = m.group(2), m.group(3) or ""
+    if len(frac) > 6:
         raise ValueError(f"at most 6 decimals: {amount!r}")
     value = int(whole or "0") * MICROS + int(frac.ljust(6, "0") or "0")
     return -value if neg else value

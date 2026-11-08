@@ -16,6 +16,7 @@ from spend_guard.api import create_app
 from spend_guard.errors import BudgetExceeded, NoCheckedPrice
 from spend_guard.gateway import FORMAT_ALLOWANCE_TOKENS, SpendGuard, max_input_tokens
 from spend_guard.ledger import SpendLedger
+from spend_guard.money import parse
 from spend_guard.probe import run_probe, seed_prices
 from spend_guard.providers.base import ProviderFailed, ProviderRejected, ProviderResult
 from spend_guard.providers.mock import MockProvider
@@ -159,7 +160,7 @@ def test_api_complete_and_budget(pool: ConnectionPool[Any], clock: Clock) -> Non
     )
     assert r.status_code == 200
     body = r.json()
-    assert body["cost"] < body["reserved"]
+    assert parse(body["cost"]) < parse(body["reserved"])
     b = c.get("/v1/budgets/acme", headers=AUTH).json()
     assert [x["scope"] for x in b] == ["global", "tenant:acme"]
 
@@ -196,5 +197,31 @@ def test_api_auth(pool: ConnectionPool[Any], clock: Clock) -> None:
     c = TestClient(create_app(guard, api_token=TOKEN))
     assert c.post("/v1/complete", json={}).status_code == 401
     assert c.get("/v1/budgets/acme", headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert c.get("/v1/budgets/acme", headers={"Authorization": TOKEN}).status_code == 401
     closed = TestClient(create_app(guard, api_token=None))
     assert closed.get("/v1/budgets/acme").status_code == 503
+
+
+def test_api_402_does_not_reveal_amounts(pool: ConnectionPool[Any], clock: Clock) -> None:
+    c = api(pool, clock, MockProvider())
+    with pool.connection() as conn:
+        conn.execute("UPDATE budgets SET daily_limit_micros = 10 WHERE scope = 'global'")
+    r = c.post("/v1/complete", headers=AUTH, json={"tenant": "acme", "model": "m1", "prompt": "hi"})
+    assert r.status_code == 402
+    assert r.json()["detail"] == "daily budget reached for global"
+
+
+def test_api_rejects_lone_surrogates(pool: ConnectionPool[Any], clock: Clock) -> None:
+    c = api(pool, clock, MockProvider())
+    body = '{"tenant": "acme", "model": "m1", "prompt": "bad \\ud800 text"}'
+    r = c.post("/v1/complete", headers={**AUTH, "content-type": "application/json"}, content=body)
+    assert r.status_code == 422
+
+
+def test_probe_replay_runs_at_its_recording_time() -> None:
+    from spend_guard.cli import probe_clock
+
+    meta = {"recorded_at": "2026-11-08T21:26:00Z"}
+    assert probe_clock(meta) == dt.datetime(2026, 11, 8, 21, 27, tzinfo=dt.UTC)
+    with pytest.raises(ValueError, match="recorded_at"):
+        probe_clock({})

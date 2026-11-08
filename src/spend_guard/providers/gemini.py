@@ -59,6 +59,18 @@ class GeminiProvider:
     ) -> ProviderResult:
         from google.genai import types
 
+        try:  # build the whole request first: a bad setting must not count or charge a call
+            config = types.GenerateContentConfig(
+                system_instruction=system or None,
+                max_output_tokens=max_output_tokens,
+                thinking_config=(
+                    types.ThinkingConfig(thinking_level=types.ThinkingLevel(self.thinking_level))
+                    if self.thinking_level
+                    else None
+                ),
+            )
+        except ValueError:
+            raise ProviderRejected("invalid Gemini request configuration") from None
         with self._lock:
             if self.calls >= self.max_calls:
                 raise ProviderRejected(
@@ -66,15 +78,6 @@ class GeminiProvider:
                     "set SPEND_GUARD_MAX_LIVE_CALLS deliberately to allow more"
                 )
             self.calls += 1
-        config = types.GenerateContentConfig(
-            system_instruction=system or None,
-            max_output_tokens=max_output_tokens,
-            thinking_config=(
-                types.ThinkingConfig(thinking_level=types.ThinkingLevel(self.thinking_level))
-                if self.thinking_level
-                else None
-            ),
-        )
         try:
             resp = self._client.models.generate_content(model=model, contents=prompt, config=config)
         except Exception as exc:
