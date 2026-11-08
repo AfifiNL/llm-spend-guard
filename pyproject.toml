@@ -27,6 +27,12 @@ llm-spend-guard = "spend_guard.cli:main"
 gemini = [
     "google-genai>=3.0",
 ]
+openai = [
+    "openai>=3.0",
+]
+anthropic = [
+    "anthropic>=2.0",
+]
 
 [dependency-groups]
 dev = [

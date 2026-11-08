@@ -1,8 +1,9 @@
 """Builds the guard from environment variables.
 
 SPEND_GUARD_DATABASE_URL     PostgreSQL (without it, a throwaway local server via pgserver)
-SPEND_GUARD_PROVIDER         mock (default) | gemini | replay
-SPEND_GUARD_MAX_LIVE_CALLS   gemini: hard cap on live calls per process (default 0)
+SPEND_GUARD_PROVIDER         mock (default) | gemini | openai | anthropic | replay
+SPEND_GUARD_MAX_LIVE_CALLS   live providers: hard cap on calls per process (default 0: none)
+SPEND_GUARD_OPENAI_API       openai: chat (default) | responses
 SPEND_GUARD_GEMINI_VERTEX    true: Vertex AI (ADC + GOOGLE_CLOUD_PROJECT); else GEMINI_API_KEY
 SPEND_GUARD_GEMINI_LOCATION, SPEND_GUARD_GEMINI_THINKING_LEVEL
 SPEND_GUARD_CASSETTE         replay: the recorded calls
@@ -45,6 +46,18 @@ def build_provider() -> Provider:
             location=_env("SPEND_GUARD_GEMINI_LOCATION") or None,
             thinking_level=_env("SPEND_GUARD_GEMINI_THINKING_LEVEL") or None,
         )
+    cap = int(_env("SPEND_GUARD_MAX_LIVE_CALLS", "0") or 0)
+    if kind == "openai":  # credentials: OPENAI_API_KEY, read by the SDK
+        from spend_guard.providers.openai_api import OpenAIProvider
+
+        api = _env("SPEND_GUARD_OPENAI_API", "chat")
+        if api not in ("chat", "responses"):
+            raise ValueError(f"unknown SPEND_GUARD_OPENAI_API {api!r}")
+        return OpenAIProvider(max_calls=cap, api="chat" if api == "chat" else "responses")
+    if kind == "anthropic":  # credentials: ANTHROPIC_API_KEY, read by the SDK
+        from spend_guard.providers.anthropic_api import AnthropicProvider
+
+        return AnthropicProvider(max_calls=cap)
     raise ValueError(f"unknown SPEND_GUARD_PROVIDER {kind!r}")
 
 

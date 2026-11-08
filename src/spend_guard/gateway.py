@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
 from spend_guard.errors import BudgetExceeded, NoBudget, NoCheckedPrice
-from spend_guard.ledger import SpendLedger
+from spend_guard.idempotency import IdempotencyStore, fingerprint
+from spend_guard.ledger import SpendLedger, tenant_scope
 from spend_guard.providers.base import Provider, ProviderFailed, ProviderRejected
 
 # Upper bound on input tokens: a tokenizer that covers at least one byte per token cannot
@@ -30,12 +32,35 @@ def max_input_tokens(system: str, prompt: str) -> int:
 
 @dataclass(frozen=True)
 class Completion:
-    request_id: uuid.UUID
+    request_id: uuid.UUID  # the reservation in the ledger
     text: str
     input_tokens: int
     output_tokens: int
     reserved_micros: int
     cost_micros: int
+    replayed: bool = False  # True: an earlier result for the same client request_id
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "reservation_id": str(self.request_id),
+            "text": self.text,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "reserved_micros": self.reserved_micros,
+            "cost_micros": self.cost_micros,
+        }
+
+    @classmethod
+    def from_record(cls, r: dict[str, Any]) -> Completion:
+        return cls(
+            uuid.UUID(r["reservation_id"]),
+            str(r["text"]),
+            int(r["input_tokens"]),
+            int(r["output_tokens"]),
+            int(r["reserved_micros"]),
+            int(r["cost_micros"]),
+            replayed=True,
+        )
 
 
 class SpendGuard:
@@ -51,6 +76,7 @@ class SpendGuard:
         self.provider = provider
         self.tracer = tracer or trace.get_tracer("spend_guard")
         self.max_output_tokens_cap = max_output_tokens_cap
+        self.idempotency = IdempotencyStore(ledger.pool, clock=ledger.clock)
 
     def complete(
         self,
@@ -60,9 +86,39 @@ class SpendGuard:
         *,
         system: str = "",
         max_output_tokens: int = 512,
+        request_id: uuid.UUID | None = None,
     ) -> Completion:
+        """With a client `request_id`, the request is charged at most once: a repeat returns
+        the stored result (`replayed=True`), a concurrent repeat raises RequestInFlight."""
         if not 0 < max_output_tokens <= self.max_output_tokens_cap:
             raise ValueError(f"max_output_tokens must be 1..{self.max_output_tokens_cap}")
+        tenant_scope(tenant)  # invalid ids fail here, before a request id is claimed
+        if request_id is None:
+            return self._complete(tenant, model, prompt, system, max_output_tokens)
+        fp = fingerprint(tenant, model, system, prompt, max_output_tokens)
+        prior = self.idempotency.begin(request_id, tenant, fp)
+        if prior is not None:
+            with self.tracer.start_as_current_span("llm.complete") as span:
+                span.set_attribute("gen_ai.request.model", model)
+                span.set_attribute("spend.tenant", tenant)
+                span.set_attribute("spend.client_request_id", str(request_id))
+                span.set_attribute("spend.outcome", "replayed")
+                span.set_attribute("spend.cost_micros", 0)
+            return Completion.from_record(prior)
+        try:
+            result = self._complete(tenant, model, prompt, system, max_output_tokens)
+        except (NoCheckedPrice, NoBudget, BudgetExceeded, ProviderRejected):
+            self.idempotency.release(request_id)  # nothing was charged: the id may be reused
+            raise
+        except BaseException as exc:
+            self.idempotency.fail(request_id, type(exc).__name__)
+            raise
+        self.idempotency.complete(request_id, result.request_id, result.to_record())
+        return result
+
+    def _complete(
+        self, tenant: str, model: str, prompt: str, system: str, max_output_tokens: int
+    ) -> Completion:
         with self.tracer.start_as_current_span("llm.complete") as span:
             span.set_attribute("gen_ai.system", self.provider.name)
             span.set_attribute("gen_ai.request.model", model)

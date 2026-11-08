@@ -33,3 +33,12 @@ class BudgetExceeded(SpendGuardError):
 
 class UnknownReservation(SpendGuardError):
     """Settle or release of a reservation that does not exist or is already closed."""
+
+
+class RequestInFlight(SpendGuardError):
+    """A request with the same client request_id is still running."""
+
+
+class RequestIdConflict(SpendGuardError):
+    """The client request_id was used for another request, or its request ended without a
+    result that can be replayed."""

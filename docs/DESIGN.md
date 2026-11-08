@@ -54,7 +54,8 @@ and run the service as another:
 ```sql
 GRANT SELECT, INSERT ON ledger, price_book, reservations, alerts TO spend_guard_app;
 GRANT SELECT, INSERT, UPDATE ON spend_day, reservations TO spend_guard_app;
-GRANT SELECT ON budgets TO spend_guard_app;
+GRANT SELECT ON budgets, api_keys TO spend_guard_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON idempotency TO spend_guard_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO spend_guard_app;
 ```
 
@@ -68,6 +69,34 @@ Measured on the live probe: 5 to 10 times the real count, on the cheap side of t
 **Fail closed.** No global budget, or no budget for the tenant and no default (`tenant:*`): the
 call is refused. The HTTP API refuses everything without a token, and cannot change prices or
 budgets.
+
+**Keys decide the tenant.** A shared token lets its holder name any tenant, so budgets per
+tenant only mean something when each client has its own credential. An API key is bound to one
+tenant at creation; the HTTP layer derives the tenant from it and refuses a request that names
+another. Only the SHA-256 of a key is stored (keys are 256-bit random, so a plain hash is
+enough; no salt or slow hash is needed against guessing), and the plaintext is printed once.
+Keys are created and revoked with the CLI only, like prices and budgets.
+
+**One request id, one charge.** Clients retry: their own timeouts, at-least-once queues. A
+client `request_id` is claimed with `INSERT … ON CONFLICT DO NOTHING`, so of several concurrent
+requests with one id exactly one proceeds and the rest get "in flight". A completed request
+stores its result and replays it. The id is freed only when nothing was charged (a refusal
+before the call, or a provider that rejected the request before any work); after a failure that
+may have been billed, or a request abandoned mid-way, the id answers 409 and the client must use
+a new one. That keeps the rule "an unknown outcome is charged at the worst case" from charging
+the same request twice. The reservation has its own id, so a freed client id can be reserved
+again without colliding with the released reservation.
+
+**Vendor adapters: classify by status, retries off.** Every SDK error is reduced to its type and
+HTTP status (vendor messages can echo request content). Statuses that mean "refused before
+generating" (400, 401, 403, 404, 409, 413, 422, 429) release the reservation; everything else,
+including timeouts and dropped connections, is charged in full. The SDKs' automatic retries are
+switched off: a hidden retry after a timeout could be billed twice for one counted call.
+
+**Cached input on the safe side.** Vendors bill cached input at other rates than fresh input.
+With one input rate per model in the price book, the adapters convert cached tokens so the
+charge can only be too high: cached reads at the full rate, Anthropic cache writes at twice it.
+A price book with separate cache rates would be more exact; it is not needed for the guarantee.
 
 **Telemetry by convention.** Spans use the OpenTelemetry GenAI attribute names where they exist
 (`gen_ai.request.model`, `gen_ai.usage.*`) and a `spend.*` namespace for the rest, so the cost

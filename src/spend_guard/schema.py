@@ -84,6 +84,28 @@ CREATE OR REPLACE TRIGGER ledger_no_update_delete BEFORE UPDATE OR DELETE ON led
 CREATE OR REPLACE TRIGGER ledger_no_truncate BEFORE TRUNCATE ON ledger
     FOR EACH STATEMENT EXECUTE FUNCTION ledger_append_only();
 
+-- API keys bind a caller to one tenant. Only the SHA-256 of a key is stored; the key itself is
+-- shown once, when it is created.
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_sha256  TEXT PRIMARY KEY CHECK (key_sha256 ~ '^[0-9a-f]{64}$'),
+    tenant      TEXT NOT NULL CHECK (tenant ~ '^[A-Za-z0-9._-]{1,200}$'),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at  TIMESTAMPTZ
+);
+
+-- Client-supplied request ids: one id is one request, answered once and replayed after that.
+CREATE TABLE IF NOT EXISTS idempotency (
+    request_id      UUID PRIMARY KEY,
+    tenant          TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('in_flight', 'completed', 'failed')),
+    reservation_id  UUID,
+    result          JSONB,
+    note            TEXT NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL,
+    finished_at     TIMESTAMPTZ
+);
+
 CREATE TABLE IF NOT EXISTS alerts (
     scope          TEXT NOT NULL,
     day            DATE NOT NULL,

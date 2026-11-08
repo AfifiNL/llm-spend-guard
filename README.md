@@ -16,8 +16,13 @@ its limit is refused before it is made, and so is a call to a model without a ch
   checks, and a `reconcile` that recomputes the totals from the ledger.
 - **OpenTelemetry spans** per call with the GenAI attributes and the reserved and charged
   amounts, for any exporter.
-- **Mock provider**, so the demo and the tests spend nothing; a Gemini adapter; and a recorded
-  live probe that CI replays through a real ledger.
+- **API keys bound to tenants** (only their SHA-256 is stored), so one client cannot spend
+  another client's budget; a shared token remains for a single trusted caller.
+- **Idempotent requests**: a client `request_id` is charged once; a retry gets the stored
+  result back, a concurrent retry gets 409.
+- **Providers**: a mock, so the demo and the tests spend nothing; a Gemini adapter with a
+  recorded live probe that CI replays through a real ledger; OpenAI and Anthropic adapters that
+  are tested with fake clients only and **have never been called against the real APIs**.
 
 ## What it does
 
@@ -59,7 +64,7 @@ schema that they drop afterwards, so they never touch real budgets, prices or le
 ```bash
 make install    # .venv with extras, dev tools and the local PostgreSQL (locked)
 make demo       # the run above
-make check      # lint, strict types, 57 tests on PostgreSQL, probe replay, demo (what CI runs)
+make check      # lint, strict types, 99 tests on PostgreSQL, probe replay, demo (what CI runs)
 ```
 
 With your own PostgreSQL:
@@ -111,13 +116,57 @@ settle ─── actual = price × reported usage, rounded up to the micro-unit;
 
 | Method | Path | Result |
 |---|---|---|
-| `POST` | `/v1/complete` | `{tenant, model, prompt, system?, max_output_tokens}` → text, usage, reserved, cost; **402** budget, **409** no checked price, **403** no budget configured, **502** provider error |
+| `POST` | `/v1/complete` | `{tenant?, model, prompt, system?, max_output_tokens, request_id?}` → text, usage, reserved, cost, `replayed`; **402** budget, **409** no checked price or request-id conflict, **403** no budget configured or another tenant's key, **502** provider error |
 | `GET` | `/v1/budgets/{tenant}` | today's limit, reserved, settled and remaining per scope |
 | `GET` | `/healthz` | liveness |
 
-Both `/v1` routes need `Authorization: Bearer $SPEND_GUARD_API_TOKEN`; without the variable they
-refuse everything. Prices and budgets can only be changed with the CLI, not over HTTP. A 402
-names the scope that is exhausted, never another scope's amounts.
+Both `/v1` routes take `Authorization: Bearer <credential>`, one of:
+
+- **an API key** from `llm-spend-guard key-create <tenant>` (printed once; only its SHA-256 is
+  stored). The key decides the tenant: the body may leave `tenant` out, and a different tenant
+  in the body or the path is refused (403). `key-list` shows key ids, `key-revoke <id>` ends one.
+- **the shared token** `SPEND_GUARD_API_TOKEN`, for one trusted caller that names the tenant in
+  every request and may use any. Unset it once every client has its own key.
+
+With neither a shared token nor an active key, every request is refused (503). Prices, budgets
+and keys can only be changed with the CLI, not over HTTP. A 402 names the scope that is
+exhausted, never another scope's amounts.
+
+### Idempotent requests
+
+A client that may retry (its own timeout, a redelivered message) sends a `request_id` (UUID):
+
+| what happened to that id before | what a new request with it gets |
+|---|---|
+| nothing | normal processing; the id is claimed |
+| still in flight | **409**, try again later |
+| completed | the stored result, `"replayed": true`; no new reservation, no model call |
+| refused before any call (price, budget) or rejected by the provider before any work | normal processing: nothing was charged, so the id was freed |
+| failed in a way that may have been billed, or abandoned for 15 minutes | **409**, use a new id: an unknown outcome is never charged twice |
+| used for a different request (other tenant, model, prompt or settings) | **409** |
+
+Stored results include the generated text; `llm-spend-guard idempotency-prune` removes finished
+entries (default: older than 24 hours).
+
+### Providers
+
+| provider | how it was tested | usage mapping |
+|---|---|---|
+| `mock` | offline, every test | deterministic token counts |
+| `gemini` | 10 live calls, recorded and replayed in CI (below) | `prompt_token_count` in; `candidates_token_count + thoughts_token_count` out |
+| `openai` | **fake clients only; never called against the real API** | Chat Completions: `prompt_tokens` in, `completion_tokens` out (already includes reasoning tokens); Responses API: `input_tokens` / `output_tokens` |
+| `anthropic` | **fake clients only; never called against the real API** | `input_tokens + 2 × cache_creation_input_tokens + cache_read_input_tokens` in; `output_tokens` out |
+
+Cached input is billed by both vendors at a discount (reads) or a premium (Anthropic cache
+writes). The price book has one input rate, so the adapters convert on the safe side: cached
+reads count at the full input rate, Anthropic cache writes at twice it (the highest write
+multiplier in Anthropic's published pricing when this was written; not re-checked). The guard
+can over-count caching, never under-count it. The adapters never ask for caching themselves.
+
+Every vendor error is classified by HTTP status: 400, 401, 403, 404, 409, 413, 422 and 429 mean
+the vendor refused the request before generating anything, so the reservation is released;
+any other status, a timeout or a dropped connection may have been billed, so the reservation is
+charged in full. The SDKs' own retries are switched off, so one call is one HTTP request.
 
 ## Live probe (Gemini)
 
@@ -160,34 +209,36 @@ re-records it (10 live calls, needs credentials).
 | variable | default | meaning |
 |---|---|---|
 | `SPEND_GUARD_DATABASE_URL` | throwaway local server | PostgreSQL |
-| `SPEND_GUARD_PROVIDER` | `mock` | `mock`, `gemini` or `replay` |
-| `SPEND_GUARD_MAX_LIVE_CALLS` | `0` | Gemini: hard cap on live calls per process; `0` makes none |
+| `SPEND_GUARD_PROVIDER` | `mock` | `mock`, `gemini`, `openai`, `anthropic` or `replay` |
+| `SPEND_GUARD_MAX_LIVE_CALLS` | `0` | live providers: hard cap on calls per process; `0` makes none |
+| `SPEND_GUARD_OPENAI_API` | `chat` | `chat` (Chat Completions) or `responses`; credentials from `OPENAI_API_KEY` |
 | `SPEND_GUARD_GEMINI_VERTEX` | unset | `true`: Vertex AI with Application Default Credentials and `GOOGLE_CLOUD_PROJECT`; else `GEMINI_API_KEY` |
 | `SPEND_GUARD_GEMINI_LOCATION`, `SPEND_GUARD_GEMINI_THINKING_LEVEL` | unset | Vertex location, thinking level |
 | `SPEND_GUARD_MAX_PRICE_AGE_DAYS` | `31` | older prices count as missing |
-| `SPEND_GUARD_API_TOKEN` | unset | required for the HTTP API |
+| `SPEND_GUARD_API_TOKEN` | unset | shared token for one trusted caller (API keys are created with the CLI) |
 | `SPEND_GUARD_OTEL_CONSOLE` | unset | `true`: print spans to stdout |
 
 ## Limits
 
-- **One provider adapter (Gemini) besides the mock.** The provider interface is three lines;
-  OpenAI and Anthropic adapters are not included and nothing here was run against them. Errors
-  without an HTTP status (for example missing credentials) are charged the worst case.
+- **Only the Gemini adapter has met a real API.** The OpenAI and Anthropic adapters follow the
+  vendors' documented SDK shapes and are tested with fake clients; their first real call may
+  still reveal a mismatch. Errors without an HTTP status (for example missing credentials) are
+  charged the worst case.
 - **Text only.** The input bound assumes text; images, audio and cached-token discounts are not
   modelled. Prices are per model, one input and one output rate, no tiers by prompt length.
 - **Days are UTC days, one currency.** No monthly budgets; prices in another currency than the
   ledger's are refused, not converted.
-- **The tenant is whatever the caller says.** Anyone holding the API token can spend any
-  tenant's budget, and a new tenant id gets the default budget; only the global budget is a
-  hard ceiling. Tie tenants to credentials in front of the API before serving several clients.
+- **The shared token can name any tenant**, and a new tenant id gets the default budget; use
+  per-tenant API keys for every client you do not fully trust. Keys have no expiry and no
+  scopes beyond the tenant.
 - **Triggers stop accidents, not the table owner.** The owner can disable a trigger. Run the
   service as a role with only `SELECT, INSERT` on `ledger` and `price_book` (DESIGN.md).
 - **Worst-case reservations refuse calls that would have fit.** Tight budgets with large
   `max_output_tokens` pause early (see the demo).
 - **Alerts are rows and a callback**, not e-mails or pages; wire `on_alert` to your own channel.
-- **One shared API token**; put your own authentication in front before exposing it.
+- **No rate limiting.** Budgets cap money, not request rates; put a proxy in front for that.
 - **Not load-tested.** Correctness under concurrency is tested (16 threads, 48 attempts, no
-  overshoot); throughput is not measured. CI runs PostgreSQL 17, local runs 16.
+  overshoot; 8 threads repeating one request id, one model call); throughput is not measured. CI runs PostgreSQL 17, local runs 16.
 
 ## License
 

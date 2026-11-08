@@ -98,6 +98,44 @@ def _cmd_sweep(a: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_key_create(a: argparse.Namespace) -> int:
+    from spend_guard.keys import create_key
+
+    with _pool().connection() as conn:
+        key, key_id = create_key(conn, a.tenant)
+    print(f"key {key_id} for tenant {a.tenant} (shown once, store it now):")
+    print(key)
+    return 0
+
+
+def _cmd_key_revoke(a: argparse.Namespace) -> int:
+    from spend_guard.keys import revoke_key
+
+    with _pool().connection() as conn:
+        n = revoke_key(conn, a.key_id)
+    print(f"revoked {n} key(s)")
+    return 0 if n else 1
+
+
+def _cmd_key_list(_: argparse.Namespace) -> int:
+    from spend_guard.keys import list_keys
+
+    with _pool().connection() as conn:
+        for k in list_keys(conn):
+            state = f"revoked {k.revoked_at:%Y-%m-%d}" if k.revoked_at else "active"
+            print(f"{k.key_id}  {k.tenant}  created {k.created_at:%Y-%m-%d}  {state}")
+    return 0
+
+
+def _cmd_idem_prune(a: argparse.Namespace) -> int:
+    from spend_guard.idempotency import IdempotencyStore
+
+    store = IdempotencyStore(_pool(), clock=lambda: dt.datetime.now(dt.UTC))
+    n = store.prune(dt.timedelta(hours=a.older_than_hours))
+    print(f"removed {n} finished request record(s)")
+    return 0
+
+
 def _cmd_demo(_: argparse.Namespace) -> int:
     from spend_guard.demo import run_demo
 
@@ -201,6 +239,18 @@ def main(argv: list[str] | None = None) -> int:
     w = sub.add_parser("sweep", help="charge abandoned reservations at their worst case")
     w.add_argument("--older-than-minutes", type=int, default=15)
     w.set_defaults(fn=_cmd_sweep)
+    kc = sub.add_parser("key-create", help="create an API key bound to one tenant")
+    kc.add_argument("tenant")
+    kc.set_defaults(fn=_cmd_key_create)
+    kr = sub.add_parser("key-revoke", help="revoke a key by its id (first 8+ hex of its hash)")
+    kr.add_argument("key_id")
+    kr.set_defaults(fn=_cmd_key_revoke)
+    sub.add_parser("key-list", help="list keys (ids and tenants, never the keys)").set_defaults(
+        fn=_cmd_key_list
+    )
+    ip = sub.add_parser("idempotency-prune", help="forget finished client request ids")
+    ip.add_argument("--older-than-hours", type=int, default=24)
+    ip.set_defaults(fn=_cmd_idem_prune)
     sub.add_parser("demo", help="offline demo with the mock model").set_defaults(fn=_cmd_demo)
     pr = sub.add_parser("probe", help="fixed prompts through the guard; checks the bound")
     pr.add_argument("--prices", default="evals/prices.json")
